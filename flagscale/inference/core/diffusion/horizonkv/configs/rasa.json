@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "policy": "bounded_two_config",
+  "best_config": {
+    "frames": 7,
+    "block_sparsity": 0.5
+  },
+  "min_config": {
+    "frames": 5,
+    "block_sparsity": 0.3
+  },
+  "switch_miss_items": 80,
+  "overlap_min_miss_items": 32,
+  "calibration": {
+    "kind": "cuda_event_14b",
+    "gpu": "NVIDIA A800-SXM4-80GB",
+    "gpu_index": "0",
+    "topk": 7,
+    "cache": 15,
+    "sparsity": 0.5,
+    "heads": 40,
+    "frame": 1560,
+    "head_dim": 128,
+    "history": 240,
+    "warmup": 3,
+    "samples": 7,
+    "origin": "CUDA event before hit-part helper (RoPE, selection, attention)",
+    "note": "Cross-stream completion comparison without Nsight; timing markers add overhead",
+    "timing_bins": {
+      "1": {
+        "hit_part_us": 4239.3598556518555,
+        "miss_ready_us": 215.55200312286615,
+        "one_shot_us": 6027.9200077056885,
+        "split_us": 6683.3600997924805,
+        "h2d_us": 94.16000172495842
+      },
+      "2": {
+        "hit_part_us": 4224.0002155303955,
+        "miss_ready_us": 223.74399658292532,
+        "one_shot_us": 6024.57594871521,
+        "split_us": 6695.791959762573,
+        "h2d_us": 139.39199596643448
+      },
+      "4": {
+        "hit_part_us": 4203.007936477661,
+        "miss_ready_us": 61.952000483870506,
+        "one_shot_us": 6033.135890960693,
+        "split_us": 6712.608098983765,
+        "h2d_us": 224.43199902772903
+      },
+      "6": {
+        "hit_part_us": 4184.576034545898,
+        "miss_ready_us": 425.9839951992035,
+        "one_shot_us": 6104.192018508911,
+        "split_us": 6754.928112030029,
+        "h2d_us": 334.960013628006
+      },
+      "8": {
+        "hit_part_us": 4161.02409362793,
+        "miss_ready_us": 429.05598878860474,
+        "one_shot_us": 6198.735952377319,
+        "split_us": 6760.047912597656,
+        "h2d_us": 417.9680049419403
+      },
+      "12": {
+        "hit_part_us": 4123.136043548584,
+        "miss_ready_us": 435.7120096683502,
+        "one_shot_us": 6366.031885147095,
+        "split_us": 6828.607797622681,
+        "h2d_us": 592.9920077323914
+      },
+      "16": {
+        "hit_part_us": 4086.2720012664795,
+        "miss_ready_us": 604.1600108146667,
+        "one_shot_us": 6531.375885009766,
+        "split_us": 6896.736145019531,
+        "h2d_us": 760.0480020046234
+      },
+      "24": {
+        "hit_part_us": 3965.4399156570435,
+        "miss_ready_us": 3818.495988845825,
+        "one_shot_us": 6858.896017074585,
+        "split_us": 6996.560096740723,
+        "h2d_us": 1099.3599891662598
+      },
+      "32": {
+        "hit_part_us": 3866.624116897583,
+        "miss_ready_us": 3722.7519750595093,
+        "one_shot_us": 7204.6239376068115,
+        "split_us": 7087.85605430603,
+        "h2d_us": 1427.6639819145203
+      },
+      "40": {
+        "hit_part_us": 3730.4320335388184,
+        "miss_ready_us": 3626.4959573745728,
+        "one_shot_us": 7547.439813613892,
+        "split_us": 7015.712022781372,
+        "h2d_us": 1766.2720084190369
+      },
+      "48": {
+        "hit_part_us": 3624.44806098938,
+        "miss_ready_us": 3568.127989768982,
+        "one_shot_us": 7797.231912612915,
+        "split_us": 6936.144113540649,
+        "h2d_us": 2055.0239086151123
+      },
+      "56": {
+        "hit_part_us": 3525.6320238113403,
+        "miss_ready_us": 3469.8240756988525,
+        "one_shot_us": 8059.872150421143,
+        "split_us": 6895.551919937134,
+        "h2d_us": 2339.8079872131348
+      },
+      "64": {
+        "hit_part_us": 3401.7279148101807,
+        "miss_ready_us": 3357.6959371566772,
+        "one_shot_us": 8330.927848815918,
+        "split_us": 6883.967876434326,
+        "h2d_us": 2628.4639835357666
+      },
+      "72": {
+        "hit_part_us": 3294.7200536727905,
+        "miss_ready_us": 3267.0719623565674,
+        "one_shot_us": 8606.240272521973,
+        "split_us": 6591.552019119263,
+        "h2d_us": 2907.3920249938965
+      },
+      "80": {
+        "hit_part_us": 3040.768027305603,
+        "miss_ready_us": 3388.9280557632446,
+        "one_shot_us": 8869.855880737305,
+        "split_us": 6625.0879764556885,
+        "h2d_us": 3180.176019668579
+      }
+    },
+    "threshold_method": "first_measured_crossing",
+    "endpoint_selection": "user_requested_equal_budget"
+  }
+}

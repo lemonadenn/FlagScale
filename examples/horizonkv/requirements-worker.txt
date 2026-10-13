@@ -1,0 +1,10 @@
+# Install in an isolated Python 3.10 environment with the HorizonKV CUDA stack.
+hydra-core==1.3.2
+omegaconf==2.3.0
+typer>=0.9.0
+aiohttp
+numpy==1.24.4
+tqdm
+# Meta initialization and strict safetensors loading for the 14B generator.
+accelerate==1.13.0
+safetensors==0.7.0
