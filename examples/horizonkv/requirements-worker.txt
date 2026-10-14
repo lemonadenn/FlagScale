@@ -1,10 +1,23 @@
-# Install in an isolated Python 3.10 environment with the HorizonKV CUDA stack.
+# Install torch first, then these dependencies; see setup_env.sh.
+-c constraints-worker.txt
 hydra-core==1.3.2
 omegaconf==2.3.0
 typer>=0.9.0
 aiohttp
 numpy==1.24.4
 tqdm
-# Meta initialization and strict safetensors loading for the 14B generator.
+torchvision==0.20.1
+triton==3.1.0
+diffusers==0.31.0
+transformers==4.49.0
+einops==0.8.2
+ftfy==6.3.1
+regex
+imageio==2.37.3
+imageio-ffmpeg==0.6.0
+Pillow
+packaging
+ninja
+psutil
 accelerate==1.13.0
 safetensors==0.7.0
