@@ -90,7 +90,6 @@ void kv_sparse_frame_materialize_varlen_cuda(
     int64_t live_start_index,
     bool has_live);
 
-
 torch::Tensor kv_sparse_select_pooled_qk_topk_cuda(
     torch::Tensor q,
     torch::Tensor frame_k,
@@ -99,26 +98,12 @@ torch::Tensor kv_sparse_select_pooled_qk_topk_cuda(
     int64_t frame_seqlen,
     int64_t max_kv_frames);
 
-std::vector<torch::Tensor> kv_sparse_lookup_frame_slots_cuda(
-    torch::Tensor head_indices,
-    torch::Tensor frame_indices,
-    torch::Tensor frame_to_slot,
-    int64_t total_tokens,
-    int64_t frame_seqlen,
-    int64_t num_heads,
-    int64_t gpu_cache_frames,
-    int64_t live_start_index,
-    int64_t live_len,
-    bool has_live);
-
-
 void kv_sparse_update_frame_slot_map_cuda(
     torch::Tensor frame_to_slot,
     torch::Tensor head_ids,
     torch::Tensor frame_ids,
     torch::Tensor slot_ids,
     torch::Tensor evicted_frame_ids);
-
 
 int64_t kv_sparse_copy_frame_plan_to_slots_cuda(
     torch::Tensor cpu_k,
@@ -142,7 +127,6 @@ int64_t kv_sparse_copy_frame_plan_to_slots_batched_cuda(
     int64_t frame_seqlen,
     int64_t gpu_cache_frames);
 
-
 int64_t kv_sparse_copy_frames_to_compact_cuda(
     torch::Tensor cpu_k,
     torch::Tensor cpu_v,
@@ -154,14 +138,12 @@ int64_t kv_sparse_copy_frames_to_compact_cuda(
     int64_t frame_seqlen,
     bool cpu_head_major);
 
-
 int64_t kv_sparse_copy_kv_span_to_cpu_cuda(
     torch::Tensor gpu_k_span,
     torch::Tensor gpu_v_span,
     torch::Tensor cpu_k,
     torch::Tensor cpu_v,
     int64_t start_token);
-
 
 int64_t kv_sparse_copy_compact_to_slots_d2d_cuda(
     torch::Tensor compact_k,
@@ -214,7 +196,6 @@ std::unordered_map<int64_t, int64_t> parse_frame_map(const py::handle& handle) {
   }
   return out;
 }
-
 
 torch::Tensor make_int64_pair_tensor(const std::vector<int64_t>& flat_pairs) {
   if (flat_pairs.empty()) {
@@ -503,7 +484,6 @@ py::dict build_compact_row_plan_cpp(
   out["covers_all_heads"] = py::bool_(active_count == rows);
   return out;
 }
-
 
 py::object kv_sparse_plan_slots_tensor_cpp(
     torch::Tensor frame_indices,
@@ -924,7 +904,6 @@ py::object kv_sparse_plan_slots_tensor_cpp(
   return std::move(out);
 }
 
-
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -947,11 +926,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   m.def("kv_sparse_select_pooled_qk_topk", &kv_sparse_select_pooled_qk_topk_cuda,
         "Fused pooled-QK frame scoring and max-kv-frame selection (CUDA)");
-  m.def("kv_sparse_lookup_frame_slots", &kv_sparse_lookup_frame_slots_cuda,
-        "GPU all-hit lookup of sparse KV frame slots");
+
   m.def("kv_sparse_update_frame_slot_map", &kv_sparse_update_frame_slot_map_cuda,
         "Batched GPU update of dense frame-to-slot metadata");
-
 
   m.def("kv_sparse_copy_frame_plan_to_slots", &kv_sparse_copy_frame_plan_to_slots_cuda,
         "Batched async HtoD copy of a dense CPU KV frame plan into GPU slots");
@@ -959,10 +936,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "One-call CUDA driver batch of pitched HtoD copies from a dense CPU KV frame plan",
         py::call_guard<py::gil_scoped_release>());
 
-
   m.def("kv_sparse_copy_kv_span_to_cpu", &kv_sparse_copy_kv_span_to_cpu_cuda,
         "Async DtoH copy of a contiguous KV token span into pinned CPU cache");
-
 
   m.def("kv_sparse_copy_frames_to_compact", &kv_sparse_copy_frames_to_compact_cuda,
         "Batched async HtoD copy of CPU-offloaded KV frame/head items into compact packed GPU buffers");

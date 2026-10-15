@@ -1,10 +1,10 @@
 # Modified for the HorizonKV inference artifact; see NOTICE.
-"""HorizonKV frame retrieval with full host KV history and OAE."""
 from __future__ import annotations
 from typing import Any
 import torch
 from .config import KVSparseConfig
 from .oae import _sparse_kv_self_attention_cpu_offload
+
 
 def sparse_kv_self_attention(
     roped_query: torch.Tensor,
@@ -41,15 +41,9 @@ def sparse_kv_self_attention(
     fast_lf_rope: bool = False,
 ) -> torch.Tensor:
     cfg = kv_sparse_config
-    if kv_cache is None or not kv_cache.get("cpu_offload_kv", False):
+    if kv_cache is None:
         raise ValueError("HorizonKV requires the full host-history KV cache")
-    if cfg.rope_semantics != "horizonkv_compacted":
-        raise ValueError("HorizonKV requires compacted RoPE")
-    score_query = (
-        selection_query
-        if cfg.score_with_unroped_qk and selection_query is not None
-        else roped_query
-    )
+    score_query = roped_query
     return _sparse_kv_self_attention_cpu_offload(
         roped_query=roped_query,
         selection_query=score_query,

@@ -1,3 +1,4 @@
+# Modified for the HorizonKV inference artifact; see NOTICE.
 """HorizonKV execution internals owned by the FlagScale integration.
 
 The modules are intentionally grouped by responsibility:

@@ -47,3 +47,6 @@ tests/unit_tests/test_vbenchlong_suite.py
 /examples/horizonkv/**/vbenchlong*
 /examples/horizonkv/**/vbench_long*
 /flagscale/inference/core/diffusion/adaspa/
+
+# Local HorizonKV migration verification (not part of the upstream example).
+/tests/unit_tests/transformations/diffusion/test_horizonkv_integration.py

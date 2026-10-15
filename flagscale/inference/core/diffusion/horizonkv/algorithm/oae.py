@@ -1,83 +1,42 @@
 # Modified for the HorizonKV inference artifact; see NOTICE.
-"""KV cache and CPU offload helpers for KV sparsity."""
-
+"""Host KV history, bounded GPU slots and overlapped hit/miss attention."""
 from __future__ import annotations
-
 import atexit
 import math
 import os
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
-
 import torch
-
 from flagscale.inference.core.diffusion.horizonkv.algorithm.config import KVSparseConfig
-from flagscale.inference.core.diffusion.horizonkv.algorithm.retrieval import _per_frame_simple_mean_cached_k, _select_kv_frame_indices_weighted_random_batched
 from flagscale.inference.core.diffusion.horizonkv.wan.attention import attention
 from flagscale.inference.core.diffusion.horizonkv.algorithm.sparse_kernels import (
     compacted_rope_apply,
     compacted_rope_apply_compact,
     compacted_rope_apply_packed_rows,
 )
-
-try:
-    import flash_attn
-except Exception:
-    flash_attn = None
-
-try:
-    from flagscale.inference.core.diffusion.horizonkv.algorithm.transfer import (
-        copy_kv_frame_plan_to_gpu_slots,
-        copy_kv_frame_plan_to_gpu_slots_batched,
-        copy_compact_to_gpu_slots_d2d,
-        copy_kv_span_to_cpu_cache,
-        copy_kv_frames_to_gpu_compact,
-        fused_kv_frame_materialize,
-        fused_kv_frame_materialize_varlen,
-        lookup_frame_slots_all_hit,
-        plan_kv_frame_slots_tensor,
-        select_pooled_qk_topk,
-        update_frame_slot_map,
-    )
-except Exception:
-    copy_kv_frame_plan_to_gpu_slots = None
-    copy_kv_frame_plan_to_gpu_slots_batched = None
-    copy_compact_to_gpu_slots_d2d = None
-    copy_kv_span_to_cpu_cache = None
-    copy_kv_frames_to_gpu_compact = None
-    fused_kv_frame_materialize = None
-    fused_kv_frame_materialize_varlen = None
-    lookup_frame_slots_all_hit = None
-    plan_kv_frame_slots_tensor = None
-    select_pooled_qk_topk = None
-    update_frame_slot_map = None
-
-try:
-    from flagscale.inference.core.diffusion.horizonkv.algorithm.triton_kernels import (
-        blocksparse_attention_pooled_triton,
-        merge_attention_lse_parts_triton,
-        merge_attention_parts_triton,
-    )
-except Exception:
-    blocksparse_attention_pooled_triton = None
-    merge_attention_lse_parts_triton = None
-    merge_attention_parts_triton = None
+import flash_attn
+from flagscale.inference.core.diffusion.horizonkv.algorithm.transfer import (
+    copy_kv_frame_plan_to_gpu_slots,
+    copy_kv_frame_plan_to_gpu_slots_batched,
+    copy_compact_to_gpu_slots_d2d,
+    copy_kv_span_to_cpu_cache,
+    copy_kv_frames_to_gpu_compact,
+    fused_kv_frame_materialize,
+    fused_kv_frame_materialize_varlen,
+    plan_kv_frame_slots_tensor,
+    select_pooled_qk_topk,
+    update_frame_slot_map,
+)
+from flagscale.inference.core.diffusion.horizonkv.algorithm.triton_kernels import (
+    blocksparse_attention_pooled_triton,
+    merge_attention_lse_parts_triton,
+)
 
 
 def _truthy_env(name: str, default: str = "0") -> bool:
-    return str(os.getenv(name, default)).strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "y",
-        "on",
-    )
-
-
-def _cache_full_flash_attn_enabled_by_env() -> bool:
-    return _truthy_env("HORIZONKV_CACHE_FULL_FLASH_ATTN", "0")
+    return str(os.getenv(name, default)).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 def _overlap_attn_enabled_by_env() -> bool:
@@ -90,87 +49,25 @@ def _overlap_flash_split_attention_enabled_by_env() -> bool:
 
 
 def _overlap_flash_materialize_enabled_by_env() -> bool:
-    return _truthy_env("HORIZONKV_OVERLAP_FLASH_MATERIALIZE", "1")
-
-
-def _overlap_compact_onload_enabled_by_env() -> bool:
-    return _truthy_env("HORIZONKV_OVERLAP_COMPACT_ONLOAD", "0")
-
-
-def _overlap_block_sparsity_from_config(
-    kv_sparse_config: KVSparseConfig | None,
-) -> float:
-    if kv_sparse_config is None:
-        return 0.0
-    try:
-        raw = getattr(kv_sparse_config, "overlap_block_sparsity", 0.5) or 0.0
-        return max(0.0, min(1.0, float(raw)))
-    except (TypeError, ValueError):
-        return 0.0
+    return True
 
 
 def _overlap_effective_block_sparsity(
-    kv_sparse_config: KVSparseConfig | None,
-    selected_frames: int | None,
+    kv_sparse_config: KVSparseConfig | None, selected_frames: int | None
 ) -> float:
-    """Optionally scale startup density by K/F to preserve the budget, capped at 1."""
-    base_sparsity = _overlap_block_sparsity_from_config(kv_sparse_config)
-    if kv_sparse_config is None or selected_frames is None:
-        return base_sparsity
-    if not bool(getattr(kv_sparse_config, "block_density_scale_by_max_kv_frames", False)):
-        return base_sparsity
-    if str(getattr(kv_sparse_config, "rule", "")) != "max_kv_frames":
-        return base_sparsity
-    try:
-        target_frames = int(getattr(kv_sparse_config, "max_kv_frames", 0) or 0)
-        selected_frames = int(selected_frames)
-    except (TypeError, ValueError):
-        return base_sparsity
-    if target_frames <= 0 or selected_frames <= 0 or selected_frames >= target_frames:
-        return base_sparsity
-    base_density = 1.0 - base_sparsity
-    effective_density = min(
-        1.0,
-        base_density * (float(target_frames) / float(selected_frames)),
-    )
-    return max(0.0, min(1.0, 1.0 - effective_density))
+    return kv_sparse_config.overlap_block_sparsity
 
 
-def _overlap_blocksparse_block_size(
-    kv_sparse_config: KVSparseConfig | None,
-    attr: str,
-) -> int:
-    try:
-        value = int(getattr(kv_sparse_config, attr, 64) or 64)
-    except (TypeError, ValueError):
-        value = 64
-    if value != 64:
-        raise ValueError("HorizonKV uses a uniform 64x64 sparse attention block")
+def _overlap_blocksparse_block_size(kv_sparse_config: KVSparseConfig | None, attr: str) -> int:
     return 64
 
 
 def _overlap_split_min_miss_items_by_env() -> int:
-    # Small miss sets do not amortize the second attention launch and LSE merge.
-    raw = str(os.getenv("HORIZONKV_OVERLAP_SPLIT_MIN_MISS_ITEMS", "6")).strip()
-    try:
-        return max(0, int(raw))
-    except Exception:
-        return 16
-
-
-def _overlap_split_min_miss_ratio_by_env() -> float:
-    raw = str(os.getenv("HORIZONKV_OVERLAP_SPLIT_MIN_MISS_RATIO", "0")).strip()
-    try:
-        return max(0.0, float(raw))
-    except Exception:
-        return 0.0
+    return int(os.environ["HORIZONKV_OVERLAP_SPLIT_MIN_MISS_ITEMS"])
 
 
 def _overlap_split_worthwhile_for_miss_counts(
-    *,
-    hit_item_count: int,
-    miss_item_count: int,
-    miss_copy_count: int,
+    *, hit_item_count: int, miss_item_count: int, miss_copy_count: int
 ) -> bool:
     miss_item_count = max(0, int(miss_item_count))
     miss_copy_count = max(0, int(miss_copy_count))
@@ -178,92 +75,17 @@ def _overlap_split_worthwhile_for_miss_counts(
         return False
     if miss_item_count < _overlap_split_min_miss_items_by_env():
         return False
-    min_ratio = _overlap_split_min_miss_ratio_by_env()
-    if min_ratio > 0.0:
-        readable_count = max(1, int(hit_item_count) + miss_item_count)
-        if (float(miss_item_count) / float(readable_count)) < min_ratio:
-            return False
     return True
 
 
-def _defer_clean_d2h_enabled_by_env() -> bool:
-    default = "1" if _overlap_attn_enabled_by_env() else "0"
-    return _truthy_env("HORIZONKV_DEFER_CLEAN_D2H", default)
-
-
-def _lazy_compact_slot_commit_enabled_by_env() -> bool:
-    return _truthy_env("HORIZONKV_LAZY_COMPACT_SLOT_COMMIT", "1")
-
-
-def _clean_gpu_fill_until_capacity_enabled_by_env() -> bool:
-    return _truthy_env("HORIZONKV_CLEAN_GPU_FILL_UNTIL_CAPACITY", "1")
-
-
-def _clean_gpu_lru_insert_enabled_by_env() -> bool:
-    return _truthy_env("HORIZONKV_CLEAN_GPU_LRU_INSERT", "0")
-
-
-def _rolling_gpu_cache_enabled_by_env() -> bool:
-    """Enable the rolling-cache ablation: only clean frames fill slots, never misses."""
-    return _truthy_env("HORIZONKV_GPU_CACHE_ROLLING", "0")
-
-
-def _rolling_gpu_cache_serial_split_enabled_by_env() -> bool:
-    return _truthy_env("HORIZONKV_ROLLING_SERIAL_SPLIT", "0")
-
-
-_NVTX_RUNTIME_ENABLED = bool(
-    _truthy_env("HORIZONKV_NVTX", "0")
-    and torch.cuda.is_available()
-)
 _NO_NVTX_CONTEXT = nullcontext()
-
-
-@contextmanager
-def _enabled_nvtx_range(label: str):
-    torch.cuda.nvtx.range_push(str(label))
-    try:
-        yield
-    finally:
-        torch.cuda.nvtx.range_pop()
-
-
-def _nvtx_range(kv_cache: dict[str, Any] | None, label: str):
-    """Return a reusable no-op context when NVTX is disabled."""
-    _ = kv_cache
-    if not _NVTX_RUNTIME_ENABLED:
-        return _NO_NVTX_CONTEXT
-    return _enabled_nvtx_range(label)
-
-
 _SHARED_CUDA_STREAMS: dict[tuple[str, int, str], torch.cuda.Stream] = {}
 _ALL_HEAD_INDICES_DEVICE_CACHE: dict[tuple[str, int, int], torch.Tensor] = {}
-_COMPULSORY_INDICES_DEVICE_CACHE: dict[
-    tuple[str, int, int, tuple[int, ...]], torch.Tensor
-] = {}
+_COMPULSORY_INDICES_DEVICE_CACHE: dict[tuple[str, int, int, tuple[int, ...]], torch.Tensor] = {}
 _COMPULSORY_INDICES_DEVICE_READY: dict[
     tuple[str, int, int, tuple[int, ...]], tuple[torch.cuda.Event, int]
 ] = {}
 _PREFETCH_SUBMIT_EXECUTOR: ThreadPoolExecutor | None = None
-
-
-def _cpu_cache_head_major_enabled_by_env() -> bool:
-    # Frame-major CPU storage makes every selected (head, frame) miss an
-    # independent K/V HtoD item, which is the unit used by the adaptive model.
-    return _truthy_env("HORIZONKV_CPU_CACHE_HEAD_MAJOR", "1")
-
-
-def _pin_cpu_cache_enabled_by_env() -> bool:
-    """Use page-locked host KV storage only when explicitly enabled.
-
-    A long 14B sample allocates one K and one V tensor per transformer block.
-    PyTorch rounds each pinned allocation independently, so page-locking the
-    full history can consume substantially more host memory than the raw KV
-    tensors.  Pageable storage keeps the same cache semantics and uses the
-    synchronous fallback for transfers, which is useful for multi-GPU quality
-    sampling where host memory is the limiting resource.
-    """
-    return _truthy_env("HORIZONKV_PIN_MEMORY", "1")
 
 
 def _shutdown_submit_executors() -> None:
@@ -279,18 +101,11 @@ atexit.register(_shutdown_submit_executors)
 
 def _can_pin_cpu_memory(device: torch.device | str) -> bool:
     dev = torch.device(device)
-    return (
-        _pin_cpu_cache_enabled_by_env()
-        and dev.type == "cuda"
-        and torch.cuda.is_available()
-    )
+    return dev.type == "cuda" and torch.cuda.is_available()
 
 
 def _zeros_cpu(
-    shape: tuple[int, ...] | list[int],
-    *,
-    dtype: torch.dtype,
-    pin_memory: bool,
+    shape: tuple[int, ...] | list[int], *, dtype: torch.dtype, pin_memory: bool
 ) -> torch.Tensor:
     try:
         return torch.zeros(shape, dtype=dtype, device="cpu", pin_memory=pin_memory)
@@ -299,7 +114,6 @@ def _zeros_cpu(
 
 
 def _pin_cpu_tensor_if_available(tensor: torch.Tensor) -> torch.Tensor:
-    """Pin CPU control tensors for asynchronous DMA; tolerate unavailable pinning."""
     if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu":
         return tensor
     try:
@@ -330,76 +144,26 @@ def build_kv_cache_state(
     num_heads = max(1, int(num_heads))
     head_dim = max(1, int(head_dim))
     device = torch.device(device)
-
-    cpu_offload = bool(getattr(kv_sparse_config, "cpu_offload_kv", False))
     gpu_cache_frames = getattr(kv_sparse_config, "gpu_cache_frames", None)
-    if kv_sparse_config is not None and getattr(kv_sparse_config, "granularity", "") == "attn_block":
-        cpu_offload = False
-        gpu_cache_frames = None
-    gpu_cache_frames = max(0, int(gpu_cache_frames or 0)) if cpu_offload else 0
-    cache_full_flash_attn = bool(
-        cpu_offload
-        and gpu_cache_frames > 0
-        and (
-            bool(getattr(kv_sparse_config, "cache_full_flash_attn", False))
-            or _cache_full_flash_attn_enabled_by_env()
-        )
-    )
-
+    gpu_cache_frames = max(0, int(gpu_cache_frames or 0))
+    cache_full_flash_attn = bool(gpu_cache_frames > 0 and False)
     base: dict[str, Any] = {
-        "cache_mode": "cpu_offload" if cpu_offload else "gpu_window",
-        "cpu_offload_kv": bool(cpu_offload),
+        "cache_mode": "cpu_offload",
+        "cpu_offload_kv": True,
         "frame_capacity": int(frame_capacity),
         "frame_seqlen": int(frame_seqlen),
         "token_capacity": int(token_capacity),
         "num_heads": int(num_heads),
         "head_dim": int(head_dim),
-        # Keep control scalars on CPU to avoid .item() synchronization and fill_ kernels.
         "global_end_index": torch.tensor([0], dtype=torch.long),
         "local_end_index": torch.tensor([0], dtype=torch.long),
-        "cache_full_flash_attn": bool(cache_full_flash_attn),
     }
-
-    if not cpu_offload:
-        base.update(
-            {
-                "k": torch.zeros(
-                    [batch_size, token_capacity, num_heads, head_dim],
-                    dtype=dtype,
-                    device=device,
-                ),
-                "v": torch.zeros(
-                    [batch_size, token_capacity, num_heads, head_dim],
-                    dtype=dtype,
-                    device=device,
-                ),
-                "frame_k_mean": torch.zeros(
-                    [batch_size, frame_capacity, num_heads, head_dim],
-                    dtype=dtype,
-                    device=device,
-                ),
-                "frame_k_max": torch.zeros(
-                    [batch_size, frame_capacity, num_heads, head_dim],
-                    dtype=dtype,
-                    device=device,
-                ),
-                "frame_k_min": torch.zeros(
-                    [batch_size, frame_capacity, num_heads, head_dim],
-                    dtype=dtype,
-                    device=device,
-                ),
-            }
-        )
-        return base
-
     pin_memory = _can_pin_cpu_memory(device)
-    cpu_cache_head_major = _cpu_cache_head_major_enabled_by_env()
     selected_frame_capacity = 0
     if kv_sparse_config is not None:
         try:
             selected_frame_capacity = max(
-                0,
-                int(getattr(kv_sparse_config, "max_kv_frames", 0) or 0),
+                0, int(getattr(kv_sparse_config, "max_kv_frames", 0) or 0)
             )
         except (TypeError, ValueError):
             selected_frame_capacity = 0
@@ -414,38 +178,14 @@ def build_kv_cache_state(
             )
         except RuntimeError:
             frame_indices_cpu_workspace = None
-    cpu_kv_shape = (
-        [batch_size, num_heads, token_capacity, head_dim]
-        if cpu_cache_head_major
-        else [batch_size, token_capacity, num_heads, head_dim]
-    )
+    cpu_kv_shape = [batch_size, num_heads, token_capacity, head_dim]
     base.update(
         {
-            "cpu_k": _zeros_cpu(
-                cpu_kv_shape,
-                dtype=dtype,
-                pin_memory=pin_memory,
-            ),
-            "cpu_v": _zeros_cpu(
-                cpu_kv_shape,
-                dtype=dtype,
-                pin_memory=pin_memory,
-            ),
-            "cpu_cache_head_major": cpu_cache_head_major,
+            "cpu_k": _zeros_cpu(cpu_kv_shape, dtype=dtype, pin_memory=pin_memory),
+            "cpu_v": _zeros_cpu(cpu_kv_shape, dtype=dtype, pin_memory=pin_memory),
+            "cpu_cache_head_major": True,
             "frame_k_mean": torch.zeros(
-                [batch_size, frame_capacity, num_heads, head_dim],
-                dtype=dtype,
-                device=device,
-            ),
-            "frame_k_max": torch.zeros(
-                [batch_size, frame_capacity, num_heads, head_dim],
-                dtype=dtype,
-                device=device,
-            ),
-            "frame_k_min": torch.zeros(
-                [batch_size, frame_capacity, num_heads, head_dim],
-                dtype=dtype,
-                device=device,
+                [batch_size, frame_capacity, num_heads, head_dim], dtype=dtype, device=device
             ),
             "gpu_cache_frames": int(gpu_cache_frames),
             "gpu_frame_to_slot_dense": (
@@ -477,7 +217,7 @@ def build_kv_cache_state(
             },
         }
     )
-    if cpu_offload and gpu_cache_frames > 0:
+    if gpu_cache_frames > 0:
         gpu_k_slots = torch.empty(
             [batch_size, num_heads, gpu_cache_frames, frame_seqlen, head_dim],
             dtype=dtype,
@@ -487,31 +227,17 @@ def build_kv_cache_state(
         base["gpu_k_slots"] = gpu_k_slots
         base["gpu_v_slots"] = gpu_v_slots
         base["gpu_k"] = gpu_k_slots.reshape(
-            batch_size,
-            num_heads * gpu_cache_frames * frame_seqlen,
-            1,
-            head_dim,
+            batch_size, num_heads * gpu_cache_frames * frame_seqlen, 1, head_dim
         )
         base["gpu_v"] = gpu_v_slots.reshape(
-            batch_size,
-            num_heads * gpu_cache_frames * frame_seqlen,
-            1,
-            head_dim,
+            batch_size, num_heads * gpu_cache_frames * frame_seqlen, 1, head_dim
         )
-        # Mirror CPU residency on GPU; identity slots are valid only after initial fill.
         gpu_frame_to_slot_device = torch.full(
-            (num_heads, frame_capacity),
-            -1,
-            dtype=torch.long,
-            device=device,
+            (num_heads, frame_capacity), -1, dtype=torch.long, device=device
         )
         identity_count = min(frame_capacity, gpu_cache_frames)
         if identity_count > 0:
-            identity_slots = torch.arange(
-                identity_count,
-                dtype=torch.long,
-                device=device,
-            )
+            identity_slots = torch.arange(identity_count, dtype=torch.long, device=device)
             gpu_frame_to_slot_device[:, :identity_count] = identity_slots.view(1, -1)
         base["gpu_frame_to_slot_device"] = gpu_frame_to_slot_device
     else:
@@ -530,9 +256,6 @@ def reset_kv_cache_state(kv_cache: dict[str, Any]) -> None:
         kv_cache["global_end_index"].fill_(0)
     if "local_end_index" in kv_cache:
         kv_cache["local_end_index"].fill_(0)
-    if not bool(kv_cache.get("cpu_offload_kv", False)):
-        return
-
     gpu_k = kv_cache.get("gpu_k", None)
     stream = None
     if isinstance(gpu_k, torch.Tensor) and gpu_k.device.type == "cuda":
@@ -574,52 +297,35 @@ def reset_kv_cache_state(kv_cache: dict[str, Any]) -> None:
     if isinstance(gpu_frame_to_slot_device, torch.Tensor):
         gpu_frame_to_slot_device.fill_(-1)
         identity_count = min(
-            int(gpu_frame_to_slot_device.shape[1]),
-            int(kv_cache.get("gpu_cache_frames", 0) or 0),
+            int(gpu_frame_to_slot_device.shape[1]), int(kv_cache.get("gpu_cache_frames", 0) or 0)
         )
         if identity_count > 0:
             identity_slots = torch.arange(
-                identity_count,
-                dtype=torch.long,
-                device=gpu_frame_to_slot_device.device,
+                identity_count, dtype=torch.long, device=gpu_frame_to_slot_device.device
             )
             gpu_frame_to_slot_device[:, :identity_count] = identity_slots.view(1, -1)
     kv_cache["_kv_sparse_gpu_hit_spec_cooldown"] = 0
     kv_cache.pop("_kv_sparse_skip_gpu_hit_plan_once", None)
     kv_cache.pop("_kv_sparse_pending_next_selection", None)
-    frame_indices_workspace = kv_cache.get(
-        "_kv_sparse_overlap_frame_indices_cpu_workspace",
-        None,
-    )
+    frame_indices_workspace = kv_cache.get("_kv_sparse_overlap_frame_indices_cpu_workspace", None)
     if isinstance(frame_indices_workspace, dict):
         frame_indices_workspace["event"] = None
 
 
-def _kv_cache_dense_frame_to_slot(kv_cache: dict[str, Any]) -> torch.Tensor | None:
-    dense = kv_cache.get("gpu_frame_to_slot_dense", None)
-    if not isinstance(dense, torch.Tensor) or dense.device.type != "cpu":
-        return None
-    return dense
-
-
 def _kv_cache_slot_state_tensors(
-    kv_cache: dict[str, Any],
+    kv_cache: dict[str, Any]
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
-    dense = _kv_cache_dense_frame_to_slot(kv_cache)
-    slot_frame_ids = kv_cache.get("gpu_slot_frame_ids_tensor_cpu", None)
-    slot_frame_lens = kv_cache.get("gpu_slot_frame_lens_tensor_cpu", None)
-    slot_last_used = kv_cache.get("gpu_slot_last_used_tensor_cpu", None)
-    tensors = (dense, slot_frame_ids, slot_frame_lens, slot_last_used)
-    if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
-        return None
-    dense_t, ids_t, lens_t, last_t = tensors
-    if not all(tensor.device.type == "cpu" and tensor.dtype == torch.long for tensor in tensors):
-        return None
-    if dense_t.ndim != 2 or ids_t.ndim != 2 or lens_t.shape != ids_t.shape or last_t.shape != ids_t.shape:
-        return None
-    if ids_t.shape[0] != dense_t.shape[0]:
-        return None
-    return dense_t, ids_t, lens_t, last_t
+    return tuple(
+        (
+            kv_cache[k]
+            for k in (
+                "gpu_frame_to_slot_dense",
+                "gpu_slot_frame_ids_tensor_cpu",
+                "gpu_slot_frame_lens_tensor_cpu",
+                "gpu_slot_last_used_tensor_cpu",
+            )
+        )
+    )
 
 
 def _kv_cache_wait_pending_slot_metadata_commit(kv_cache: dict[str, Any] | None) -> bool:
@@ -632,50 +338,42 @@ def _kv_cache_wait_pending_slot_metadata_commit(kv_cache: dict[str, Any] | None)
     if not isinstance(pending, list):
         return True
     ok = True
-    with _nvtx_range(kv_cache, "horizonkv.apply_pending_slot_metadata_commit"):
-        for item in pending:
-            if not isinstance(item, dict):
-                continue
-            stage = item.get("stage", None)
-            if not isinstance(stage, dict):
-                continue
-            ready_event = item.get("ready_event", None)
-            if ready_event is not None and torch.cuda.is_available():
-                try:
-                    device = item.get("device", None)
-                    device = torch.device(device) if device is not None else None
-                    current_stream = (
-                        torch.cuda.current_stream(device)
-                        if device is not None
-                        else torch.cuda.current_stream()
-                    )
-                    current_stream.wait_event(ready_event)
-                except Exception:
-                    pass
-            committed = _kv_cache_commit_compact_stage_slots(
-                kv_cache,
-                stage,
-                frame_seqlen=int(item.get("frame_seqlen", 0) or 0),
-                total_tokens=int(item.get("total_tokens", 0) or 0),
-                device_wait_event=ready_event,
+    for item in pending:
+        if not isinstance(item, dict):
+            continue
+        stage = item.get("stage", None)
+        if not isinstance(stage, dict):
+            continue
+        ready_event = item.get("ready_event", None)
+        if ready_event is not None and torch.cuda.is_available():
+            try:
+                device = item.get("device", None)
+                device = torch.device(device) if device is not None else None
+                current_stream = (
+                    torch.cuda.current_stream(device)
+                    if device is not None
+                    else torch.cuda.current_stream()
+                )
+                current_stream.wait_event(ready_event)
+            except Exception:
+                pass
+        committed = _kv_cache_commit_compact_stage_slots(
+            kv_cache,
+            stage,
+            frame_seqlen=int(item.get("frame_seqlen", 0) or 0),
+            total_tokens=int(item.get("total_tokens", 0) or 0),
+            device_wait_event=ready_event,
+        )
+        ok = bool(ok and committed)
+        if committed and item.get("identity_fill_end", None) is not None:
+            identity_fill_end = int(item["identity_fill_end"])
+            kv_cache["gpu_identity_filled_frames"] = max(
+                int(kv_cache.get("gpu_identity_filled_frames", 0) or 0), identity_fill_end
             )
-            ok = bool(ok and committed)
-            if committed and item.get("identity_fill_end", None) is not None:
-                identity_fill_end = int(item["identity_fill_end"])
-                kv_cache["gpu_identity_filled_frames"] = max(
-                    int(kv_cache.get("gpu_identity_filled_frames", 0) or 0),
-                    identity_fill_end,
-                )
-                kv_cache["_kv_sparse_clean_gpu_identity_fill_scheduled_frames"] = max(
-                    int(
-                        kv_cache.get(
-                            "_kv_sparse_clean_gpu_identity_fill_scheduled_frames",
-                            0,
-                        )
-                        or 0
-                    ),
-                    identity_fill_end,
-                )
+            kv_cache["_kv_sparse_clean_gpu_identity_fill_scheduled_frames"] = max(
+                int(kv_cache.get("_kv_sparse_clean_gpu_identity_fill_scheduled_frames", 0) or 0),
+                identity_fill_end,
+            )
     kv_cache.pop("_kv_sparse_pending_slot_metadata_commit", None)
     return ok
 
@@ -696,8 +394,8 @@ def _kv_cache_commit_incremental_tensor_slot_plan_state(
         if (
             isinstance(value, torch.Tensor)
             and value.device.type == "cpu"
-            and value.dtype == torch.long
-            and value.ndim == 1
+            and (value.dtype == torch.long)
+            and (value.ndim == 1)
         ):
             return _pin_cpu_tensor_if_available(value.contiguous())
         return None
@@ -718,7 +416,7 @@ def _kv_cache_commit_incremental_tensor_slot_plan_state(
         hit_slot_ids,
         hit_last_used,
     )
-    if any(value is None for value in required):
+    if any((value is None for value in required)):
         return False
     assert fill_head_ids is not None
     assert fill_frame_ids is not None
@@ -727,18 +425,16 @@ def _kv_cache_commit_incremental_tensor_slot_plan_state(
     assert hit_head_ids is not None
     assert hit_slot_ids is not None
     assert hit_last_used is not None
-
     fill_count = int(fill_head_ids.numel())
     hit_count = int(hit_head_ids.numel())
     if (
         int(fill_frame_ids.numel()) != fill_count
         or int(fill_slot_ids.numel()) != fill_count
         or int(fill_last_used.numel()) != fill_count
-        or int(hit_slot_ids.numel()) != hit_count
-        or int(hit_last_used.numel()) != hit_count
+        or (int(hit_slot_ids.numel()) != hit_count)
+        or (int(hit_last_used.numel()) != hit_count)
     ):
         return False
-
     slot_state = _kv_cache_slot_state_tensors(kv_cache)
     if slot_state is None:
         return False
@@ -746,7 +442,6 @@ def _kv_cache_commit_incremental_tensor_slot_plan_state(
     num_heads = int(slot_frame_ids_t.shape[0])
     gpu_cache_frames = int(slot_frame_ids_t.shape[1])
     frame_capacity = int(dense.shape[1])
-
     if hit_count > 0:
         hit_valid = (
             hit_head_ids.ge(0)
@@ -759,26 +454,18 @@ def _kv_cache_commit_incremental_tensor_slot_plan_state(
             write_hit_slots = hit_slot_ids[hit_valid]
             write_hit_last = hit_last_used[hit_valid]
             slot_last_used_t[write_hit_heads, write_hit_slots] = write_hit_last
-
     if fill_count <= 0:
         kv_cache["gpu_clock"] = max(int(kv_cache.get("gpu_clock", 0) or 0), int(next_clock))
         return True
-
     heads = fill_head_ids.contiguous()
     frames = fill_frame_ids.contiguous()
     slots = fill_slot_ids.contiguous()
     last_used = fill_last_used.contiguous()
-    head_slot_valid = (
-        heads.ge(0)
-        & heads.lt(num_heads)
-        & slots.ge(0)
-        & slots.lt(gpu_cache_frames)
-    )
+    head_slot_valid = heads.ge(0) & heads.lt(num_heads) & slots.ge(0) & slots.lt(gpu_cache_frames)
     frame_valid = head_slot_valid & frames.ge(0) & frames.lt(frame_capacity)
     if not bool(frame_valid.any().item()):
         kv_cache["gpu_clock"] = max(int(kv_cache.get("gpu_clock", 0) or 0), int(next_clock))
         return True
-
     valid_heads = heads[frame_valid]
     valid_slots = slots[frame_valid]
     valid_frames = frames[frame_valid]
@@ -786,7 +473,6 @@ def _kv_cache_commit_incremental_tensor_slot_plan_state(
     unique_head_slots = torch.unique(valid_heads * gpu_cache_frames + valid_slots)
     if int(unique_head_slots.numel()) != int(valid_heads.numel()):
         return False
-
     old_frames = slot_frame_ids_t[valid_heads, valid_slots].clone()
     old_valid = old_frames.ge(0) & old_frames.lt(frame_capacity)
     if bool(old_valid.any().item()):
@@ -795,14 +481,9 @@ def _kv_cache_commit_incremental_tensor_slot_plan_state(
         old_frames_valid = old_frames[old_valid]
         old_matches = dense[old_heads, old_frames_valid].eq(old_slots)
         if bool(old_matches.any().item()):
-            dense[
-                old_heads[old_matches],
-                old_frames_valid[old_matches],
-            ] = -1
-
+            dense[old_heads[old_matches], old_frames_valid[old_matches]] = -1
     frame_lens = (int(total_tokens) - valid_frames * int(frame_seqlen)).clamp(
-        min=0,
-        max=int(frame_seqlen),
+        min=0, max=int(frame_seqlen)
     )
     nonempty = frame_lens.gt(0)
     if bool(nonempty.any().item()):
@@ -815,14 +496,11 @@ def _kv_cache_commit_incremental_tensor_slot_plan_state(
         slot_frame_ids_t[write_heads, write_slots] = write_frames
         slot_frame_lens_t[write_heads, write_slots] = write_lens
         slot_last_used_t[write_heads, write_slots] = write_last_used
-
         gpu_frame_to_slot_device = kv_cache.get("gpu_frame_to_slot_device", None)
         if (
-            update_frame_slot_map is not None
-            and isinstance(gpu_frame_to_slot_device, torch.Tensor)
+            isinstance(gpu_frame_to_slot_device, torch.Tensor)
             and gpu_frame_to_slot_device.device.type == "cuda"
         ):
-            # Re-pin indexed update vectors before asynchronous H2D.
             write_heads = _pin_cpu_tensor_if_available(write_heads.contiguous())
             write_frames = _pin_cpu_tensor_if_available(write_frames.contiguous())
             write_slots = _pin_cpu_tensor_if_available(write_slots.contiguous())
@@ -831,37 +509,25 @@ def _kv_cache_commit_incremental_tensor_slot_plan_state(
                 update_frame_slot_map(
                     frame_to_slot=gpu_frame_to_slot_device,
                     head_ids=write_heads.to(
-                        device=gpu_frame_to_slot_device.device,
-                        non_blocking=True,
+                        device=gpu_frame_to_slot_device.device, non_blocking=True
                     ),
                     frame_ids=write_frames.to(
-                        device=gpu_frame_to_slot_device.device,
-                        non_blocking=True,
+                        device=gpu_frame_to_slot_device.device, non_blocking=True
                     ),
                     slot_ids=write_slots.to(
-                        device=gpu_frame_to_slot_device.device,
-                        non_blocking=True,
+                        device=gpu_frame_to_slot_device.device, non_blocking=True
                     ),
                     evicted_frame_ids=write_old_frames.to(
-                        device=gpu_frame_to_slot_device.device,
-                        non_blocking=True,
+                        device=gpu_frame_to_slot_device.device, non_blocking=True
                     ),
                 )
             except Exception:
-                # The CPU state remains authoritative; a failed mirror update
-                # only disables future all-hit shortcuts for these entries.
                 gpu_frame_to_slot_device.fill_(-1)
-
     kv_cache["gpu_clock"] = max(int(kv_cache.get("gpu_clock", 0) or 0), int(next_clock))
     return True
 
 
-def _sink_frame_indices(
-    Lk: int,
-    kv_start: int,
-    frame_seqlen: int,
-    sink_tokens: int,
-) -> set[int]:
+def _sink_frame_indices(Lk: int, kv_start: int, frame_seqlen: int, sink_tokens: int) -> set[int]:
     if sink_tokens <= 0:
         return set()
     sink_len = min(Lk, max(0, int(sink_tokens) - int(kv_start)))
@@ -883,14 +549,11 @@ def _mandatory_kv_frame_indices(
     if Lk <= 0 or frame_seqlen <= 0:
         return set()
     chunk_tokens = max(1, int(num_frame_per_block) * int(frame_seqlen))
-    chunk_lo = (int(current_start) // chunk_tokens) * chunk_tokens
+    chunk_lo = int(current_start) // chunk_tokens * chunk_tokens
     chunk_hi = chunk_lo + chunk_tokens
-    cs, ce = int(current_start), int(current_end)
+    cs, ce = (int(current_start), int(current_end))
     base = int(current_end) - int(local_end_index) + int(kv_start)
-    intervals = [
-        (chunk_lo - base, chunk_hi - base),
-        (cs - base, ce - base),
-    ]
+    intervals = [(chunk_lo - base, chunk_hi - base), (cs - base, ce - base)]
     out: set[int] = set()
     for a, b in intervals:
         lo = max(0, int(a))
@@ -913,15 +576,10 @@ def _preceding_kv_frame_indices(
     num_frame_per_block: int,
     preceding_frames: int | None,
 ) -> set[int]:
-    if (
-        Lk <= 0
-        or frame_seqlen <= 0
-        or preceding_frames is None
-        or int(preceding_frames) <= 0
-    ):
+    if Lk <= 0 or frame_seqlen <= 0 or preceding_frames is None or (int(preceding_frames) <= 0):
         return set()
     chunk_tokens = max(1, int(num_frame_per_block) * int(frame_seqlen))
-    chunk_start = (int(current_start) // chunk_tokens) * chunk_tokens
+    chunk_start = int(current_start) // chunk_tokens * chunk_tokens
     window_global_start = int(current_end) - int(local_end_index) + int(kv_start)
     local_chunk_start = int(chunk_start) - int(window_global_start)
     end_frame = local_chunk_start // int(frame_seqlen)
@@ -931,17 +589,8 @@ def _preceding_kv_frame_indices(
     return set(range(start_frame, end_frame))
 
 
-def _recent_kv_frame_indices(
-    Lk: int,
-    frame_seqlen: int,
-    recent_frames: int | None,
-) -> set[int]:
-    if (
-        Lk <= 0
-        or frame_seqlen <= 0
-        or recent_frames is None
-        or int(recent_frames) <= 0
-    ):
+def _recent_kv_frame_indices(Lk: int, frame_seqlen: int, recent_frames: int | None) -> set[int]:
+    if Lk <= 0 or frame_seqlen <= 0 or recent_frames is None or (int(recent_frames) <= 0):
         return set()
     n_frames = max(1, (int(Lk) + int(frame_seqlen) - 1) // int(frame_seqlen))
     start_frame = max(0, n_frames - int(recent_frames))
@@ -962,17 +611,17 @@ def _kv_cache_update_slot_metadata_fast(
         isinstance(head_ids, torch.Tensor)
         and isinstance(slot_ids, torch.Tensor)
         and isinstance(frame_ids, torch.Tensor)
-        and head_ids.device.type == "cpu"
-        and slot_ids.device.type == "cpu"
-        and frame_ids.device.type == "cpu"
-        and head_ids.dtype == torch.long
-        and slot_ids.dtype == torch.long
-        and frame_ids.dtype == torch.long
-        and head_ids.ndim == 1
-        and slot_ids.ndim == 1
-        and frame_ids.ndim == 1
-        and int(head_ids.numel()) == int(slot_ids.numel())
-        and int(frame_ids.numel()) == int(head_ids.numel())
+        and (head_ids.device.type == "cpu")
+        and (slot_ids.device.type == "cpu")
+        and (frame_ids.device.type == "cpu")
+        and (head_ids.dtype == torch.long)
+        and (slot_ids.dtype == torch.long)
+        and (frame_ids.dtype == torch.long)
+        and (head_ids.ndim == 1)
+        and (slot_ids.ndim == 1)
+        and (frame_ids.ndim == 1)
+        and (int(head_ids.numel()) == int(slot_ids.numel()))
+        and (int(frame_ids.numel()) == int(head_ids.numel()))
     ):
         return False
     slot_state = _kv_cache_slot_state_tensors(kv_cache)
@@ -987,9 +636,7 @@ def _kv_cache_update_slot_metadata_fast(
         return True
 
     def _keep_last_by_head_slot(
-        heads_t: torch.Tensor,
-        slots_t: torch.Tensor,
-        *payload_tensors: torch.Tensor,
+        heads_t: torch.Tensor, slots_t: torch.Tensor, *payload_tensors: torch.Tensor
     ) -> tuple[torch.Tensor, ...]:
         if int(heads_t.numel()) <= 1:
             return (heads_t, slots_t, *payload_tensors)
@@ -1001,35 +648,24 @@ def _kv_cache_update_slot_metadata_fast(
             return (heads_t, slots_t, *payload_tensors)
         keep_positions = torch.tensor(sorted(last_positions.values()), dtype=torch.long)
         tensors = (heads_t, slots_t, *payload_tensors)
-        return tuple(tensor[keep_positions] for tensor in tensors)
+        return tuple((tensor[keep_positions] for tensor in tensors))
 
     clock = int(kv_cache.get("gpu_clock", 0) or 0)
-
     heads = head_ids.contiguous()
     slots = slot_ids.contiguous()
     frames = frame_ids.contiguous()
-    head_slot_valid = (
-        heads.ge(0)
-        & heads.lt(num_heads)
-        & slots.ge(0)
-        & slots.lt(gpu_cache_frames)
-    )
+    head_slot_valid = heads.ge(0) & heads.lt(num_heads) & slots.ge(0) & slots.lt(gpu_cache_frames)
     frame_valid = head_slot_valid & frames.ge(0) & frames.lt(frame_capacity)
     if not bool(frame_valid.any().item()):
         kv_cache["gpu_clock"] = max(clock, clock + n)
         return True
-
     valid_heads = heads[frame_valid]
     valid_slots = slots[frame_valid]
     valid_frames = frames[frame_valid]
     valid_orig_indices = torch.arange(n, dtype=torch.long)[frame_valid]
     valid_heads, valid_slots, valid_frames, valid_orig_indices = _keep_last_by_head_slot(
-        valid_heads,
-        valid_slots,
-        valid_frames,
-        valid_orig_indices,
+        valid_heads, valid_slots, valid_frames, valid_orig_indices
     )
-
     old_frames = slot_frame_ids_t[valid_heads, valid_slots].clone()
     old_valid = old_frames.ge(0) & old_frames.lt(frame_capacity)
     if bool(old_valid.any().item()):
@@ -1039,10 +675,8 @@ def _kv_cache_update_slot_metadata_fast(
         old_matches = dense[old_heads, old_frames_valid].eq(old_slots)
         if bool(old_matches.any().item()):
             dense[old_heads[old_matches], old_frames_valid[old_matches]] = -1
-
     frame_lens = (int(total_tokens) - valid_frames * int(frame_seqlen)).clamp(
-        min=0,
-        max=int(frame_seqlen),
+        min=0, max=int(frame_seqlen)
     )
     nonempty = frame_lens.gt(0)
     if bool(nonempty.any().item()):
@@ -1055,11 +689,9 @@ def _kv_cache_update_slot_metadata_fast(
         slot_frame_ids_t[write_heads, write_slots] = write_frames
         slot_frame_lens_t[write_heads, write_slots] = write_lens
         slot_last_used_t[write_heads, write_slots] = write_last_used
-
         gpu_frame_to_slot_device = kv_cache.get("gpu_frame_to_slot_device", None)
         if (
-            update_frame_slot_map is not None
-            and isinstance(gpu_frame_to_slot_device, torch.Tensor)
+            isinstance(gpu_frame_to_slot_device, torch.Tensor)
             and gpu_frame_to_slot_device.device.type == "cuda"
         ):
             write_heads = _pin_cpu_tensor_if_available(write_heads.contiguous())
@@ -1070,34 +702,27 @@ def _kv_cache_update_slot_metadata_fast(
                 update_frame_slot_map(
                     frame_to_slot=gpu_frame_to_slot_device,
                     head_ids=write_heads.to(
-                        device=gpu_frame_to_slot_device.device,
-                        non_blocking=True,
+                        device=gpu_frame_to_slot_device.device, non_blocking=True
                     ),
                     frame_ids=write_frames.to(
-                        device=gpu_frame_to_slot_device.device,
-                        non_blocking=True,
+                        device=gpu_frame_to_slot_device.device, non_blocking=True
                     ),
                     slot_ids=write_slots.to(
-                        device=gpu_frame_to_slot_device.device,
-                        non_blocking=True,
+                        device=gpu_frame_to_slot_device.device, non_blocking=True
                     ),
                     evicted_frame_ids=write_old_frames.to(
-                        device=gpu_frame_to_slot_device.device,
-                        non_blocking=True,
+                        device=gpu_frame_to_slot_device.device, non_blocking=True
                     ),
                 )
             except Exception:
                 gpu_frame_to_slot_device.fill_(-1)
-
     kv_cache["gpu_clock"] = max(int(kv_cache.get("gpu_clock", 0) or 0), clock + n)
     _ = device_wait_event
     return True
 
 
 def _kv_cache_commit_tensor_slot_plan_state(
-    kv_cache: dict[str, Any],
-    plan_result: dict[str, Any],
-    next_clock: int,
+    kv_cache: dict[str, Any], plan_result: dict[str, Any], next_clock: int
 ) -> bool:
     if not bool(plan_result.get("tensor_slot_state", False)):
         return False
@@ -1106,25 +731,33 @@ def _kv_cache_commit_tensor_slot_plan_state(
     slot_frame_lens = plan_result.get("slot_frame_lens", None)
     slot_last_used = plan_result.get("slot_last_used", None)
     tensors = (frame_to_slot, slot_frame_ids, slot_frame_lens, slot_last_used)
-    if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
+    if not all((isinstance(tensor, torch.Tensor) for tensor in tensors)):
         return False
-    if not all(tensor.device.type == "cpu" and tensor.dtype == torch.long for tensor in tensors):
+    if not all((tensor.device.type == "cpu" and tensor.dtype == torch.long for tensor in tensors)):
         return False
     if frame_to_slot.ndim != 2 or slot_frame_ids.ndim != 2:
         return False
-    if slot_frame_lens.shape != slot_frame_ids.shape or slot_last_used.shape != slot_frame_ids.shape:
+    if (
+        slot_frame_lens.shape != slot_frame_ids.shape
+        or slot_last_used.shape != slot_frame_ids.shape
+    ):
         return False
-
     kv_cache["gpu_frame_to_slot_dense"] = _pin_cpu_tensor_if_available(frame_to_slot.contiguous())
-    kv_cache["gpu_slot_frame_ids_tensor_cpu"] = _pin_cpu_tensor_if_available(slot_frame_ids.contiguous())
-    kv_cache["gpu_slot_frame_lens_tensor_cpu"] = _pin_cpu_tensor_if_available(slot_frame_lens.contiguous())
-    kv_cache["gpu_slot_last_used_tensor_cpu"] = _pin_cpu_tensor_if_available(slot_last_used.contiguous())
+    kv_cache["gpu_slot_frame_ids_tensor_cpu"] = _pin_cpu_tensor_if_available(
+        slot_frame_ids.contiguous()
+    )
+    kv_cache["gpu_slot_frame_lens_tensor_cpu"] = _pin_cpu_tensor_if_available(
+        slot_frame_lens.contiguous()
+    )
+    kv_cache["gpu_slot_last_used_tensor_cpu"] = _pin_cpu_tensor_if_available(
+        slot_last_used.contiguous()
+    )
     kv_cache["gpu_clock"] = int(next_clock)
     gpu_frame_to_slot_device = kv_cache.get("gpu_frame_to_slot_device", None)
     if (
         isinstance(gpu_frame_to_slot_device, torch.Tensor)
         and gpu_frame_to_slot_device.device.type == "cuda"
-        and tuple(gpu_frame_to_slot_device.shape) == tuple(frame_to_slot.shape)
+        and (tuple(gpu_frame_to_slot_device.shape) == tuple(frame_to_slot.shape))
     ):
         gpu_frame_to_slot_device.copy_(frame_to_slot, non_blocking=True)
     return True
@@ -1158,8 +791,6 @@ def _kv_cache_queue_compact_stage_slots_commit(
     ready_event: torch.cuda.Event | None = None,
     device: torch.device | None = None,
 ) -> bool:
-    if not _lazy_compact_slot_commit_enabled_by_env():
-        return False
     commit_stage = {
         "scatter_head_ids_cpu": stage["scatter_head_ids_cpu"],
         "scatter_slot_ids_cpu": stage["scatter_slot_ids_cpu"],
@@ -1197,17 +828,17 @@ def _kv_cache_queue_slot_metadata_commit(
         isinstance(head_ids, torch.Tensor)
         and isinstance(slot_ids, torch.Tensor)
         and isinstance(frame_ids, torch.Tensor)
-        and head_ids.device.type == "cpu"
-        and slot_ids.device.type == "cpu"
-        and frame_ids.device.type == "cpu"
-        and head_ids.dtype == torch.long
-        and slot_ids.dtype == torch.long
-        and frame_ids.dtype == torch.long
-        and head_ids.ndim == 1
-        and slot_ids.ndim == 1
-        and frame_ids.ndim == 1
-        and int(head_ids.numel()) == int(slot_ids.numel())
-        and int(frame_ids.numel()) == int(head_ids.numel())
+        and (head_ids.device.type == "cpu")
+        and (slot_ids.device.type == "cpu")
+        and (frame_ids.device.type == "cpu")
+        and (head_ids.dtype == torch.long)
+        and (slot_ids.dtype == torch.long)
+        and (frame_ids.dtype == torch.long)
+        and (head_ids.ndim == 1)
+        and (slot_ids.ndim == 1)
+        and (frame_ids.ndim == 1)
+        and (int(head_ids.numel()) == int(slot_ids.numel()))
+        and (int(frame_ids.numel()) == int(head_ids.numel()))
     ):
         return False
     pending = kv_cache.setdefault("_kv_sparse_pending_slot_metadata_commits", [])
@@ -1231,14 +862,12 @@ def _kv_cache_queue_slot_metadata_commit(
     return True
 
 
-def _shared_cuda_stream(
-    *,
-    device: torch.device,
-    name: str,
-) -> torch.cuda.Stream | None:
+def _shared_cuda_stream(*, device: torch.device, name: str) -> torch.cuda.Stream | None:
     if device.type != "cuda" or not torch.cuda.is_available():
         return None
-    device_index = int(device.index) if device.index is not None else int(torch.cuda.current_device())
+    device_index = (
+        int(device.index) if device.index is not None else int(torch.cuda.current_device())
+    )
     key = ("cuda", device_index, str(name))
     stream = _SHARED_CUDA_STREAMS.get(key, None)
     if stream is not None:
@@ -1253,35 +882,24 @@ def _shared_cuda_stream(
 
 
 def _stage_overlap_frame_indices_to_cpu_async(
-    kv_cache: dict[str, Any],
-    frame_indices: torch.Tensor,
+    kv_cache: dict[str, Any], frame_indices: torch.Tensor
 ) -> dict[str, Any] | None:
-    """Stage selected-frame metadata into pinned CPU memory without blocking submission."""
     if (
         frame_indices.device.type != "cuda"
         or frame_indices.dtype != torch.long
         or frame_indices.ndim != 2
-        or not torch.cuda.is_available()
+        or (not torch.cuda.is_available())
     ):
         return None
-    copy_stream = _shared_cuda_stream(
-        device=frame_indices.device,
-        name="overlap_frame_indices_d2h",
-    )
+    copy_stream = _shared_cuda_stream(device=frame_indices.device, name="overlap_frame_indices_d2h")
     if copy_stream is None:
         return None
-
     workspace = kv_cache.setdefault(
-        "_kv_sparse_overlap_frame_indices_cpu_workspace",
-        {"buffer": None, "event": None},
+        "_kv_sparse_overlap_frame_indices_cpu_workspace", {"buffer": None, "event": None}
     )
     if not isinstance(workspace, dict):
         workspace = {"buffer": None, "event": None}
         kv_cache["_kv_sparse_overlap_frame_indices_cpu_workspace"] = workspace
-
-    # Do not synchronize the compute thread just to recycle the previous
-    # pinned metadata buffer. Allocate a replacement while the old async D2H
-    # is still in flight and retain the old buffer until its event completes.
     pending = workspace.setdefault("pending", [])
     if pending:
         pending[:] = [(buf, ev) for buf, ev in pending if not ev.query()]
@@ -1297,27 +915,20 @@ def _stage_overlap_frame_indices_to_cpu_async(
                 workspace["event"] = None
         except Exception:
             buffer = None
-
     required = int(frame_indices.numel())
     if (
         not isinstance(buffer, torch.Tensor)
         or buffer.device.type != "cpu"
         or buffer.dtype != torch.long
-        or not buffer.is_pinned()
-        or int(buffer.numel()) < required
+        or (not buffer.is_pinned())
+        or (int(buffer.numel()) < required)
     ):
         capacity = 1 << max(0, required - 1).bit_length()
         try:
-            buffer = torch.empty(
-                (capacity,),
-                dtype=torch.long,
-                device="cpu",
-                pin_memory=True,
-            )
+            buffer = torch.empty((capacity,), dtype=torch.long, device="cpu", pin_memory=True)
         except RuntimeError:
             return None
     workspace["buffer"] = buffer
-
     cpu_view = buffer.reshape(-1).narrow(0, 0, required).view(frame_indices.shape)
     try:
         with torch.cuda.device(frame_indices.device):
@@ -1333,30 +944,23 @@ def _stage_overlap_frame_indices_to_cpu_async(
     except Exception:
         return None
     workspace["event"] = done_event
-    return {
-        "tensor": cpu_view,
-        "event": done_event,
-        "workspace": workspace,
-    }
+    return {"tensor": cpu_view, "event": done_event, "workspace": workspace}
 
 
-def _resolve_staged_overlap_frame_indices_cpu(
-    staged: dict[str, Any] | None,
-) -> torch.Tensor | None:
+def _resolve_staged_overlap_frame_indices_cpu(staged: dict[str, Any] | None) -> torch.Tensor | None:
     if not isinstance(staged, dict):
         return None
     tensor = staged.get("tensor", None)
     if not (
         isinstance(tensor, torch.Tensor)
         and tensor.device.type == "cpu"
-        and tensor.dtype == torch.long
+        and (tensor.dtype == torch.long)
         and tensor.is_contiguous()
     ):
         return None
     event = staged.get("event", None)
     if event is not None:
         try:
-            # Wait only if the metadata D2H event is still pending.
             if not event.query():
                 event.synchronize()
         except Exception:
@@ -1378,8 +982,8 @@ def _all_head_indices_device(num_heads: int, device: torch.device) -> torch.Tens
     if (
         isinstance(cached, torch.Tensor)
         and cached.device == device
-        and cached.dtype == torch.long
-        and int(cached.numel()) == num_heads
+        and (cached.dtype == torch.long)
+        and (int(cached.numel()) == num_heads)
     ):
         return cached
     tensor = torch.arange(num_heads, device=device, dtype=torch.long)
@@ -1388,8 +992,7 @@ def _all_head_indices_device(num_heads: int, device: torch.device) -> torch.Tens
 
 
 def _kv_cache_cpu_copy_stream(
-    kv_cache: dict[str, Any],
-    device: torch.device,
+    kv_cache: dict[str, Any], device: torch.device
 ) -> torch.cuda.Stream | None:
     _ = kv_cache
     return _shared_cuda_stream(device=device, name="cpu_copy")
@@ -1416,120 +1019,17 @@ def update_gpu_kv_cache_frames(
     frame_v: torch.Tensor,
     producer_event: torch.cuda.Event | None = None,
 ) -> None:
-    _ = current_start, num_frame_per_block
-    fill_until_capacity = _clean_gpu_fill_until_capacity_enabled_by_env()
-    if (
-        not isinstance(kv_cache, dict)
-        or not bool(kv_cache.get("cpu_offload_kv", False))
-        or (not fill_until_capacity and not _rolling_gpu_cache_enabled_by_env())
-    ):
+    _ = (current_start, num_frame_per_block)
+    if not isinstance(kv_cache, dict):
         return
     gpu_cache_frames = int(kv_cache.get("gpu_cache_frames", 0) or 0)
     if gpu_cache_frames <= 0:
         return
-
-    # The rolling-cache ablation fills slots from clean frames only.
-    if _rolling_gpu_cache_enabled_by_env():
-        gpu_k = kv_cache.get("gpu_k", None)
-        gpu_v = kv_cache.get("gpu_v", None)
-        gpu_k_slots = kv_cache.get("gpu_k_slots", None)
-        gpu_v_slots = kv_cache.get("gpu_v_slots", None)
-        cpu_k = kv_cache.get("cpu_k", None)
-        if not (
-            isinstance(gpu_k, torch.Tensor)
-            and isinstance(gpu_v, torch.Tensor)
-            and isinstance(gpu_k_slots, torch.Tensor)
-            and isinstance(gpu_v_slots, torch.Tensor)
-            and isinstance(cpu_k, torch.Tensor)
-            and isinstance(frame_k, torch.Tensor)
-            and isinstance(frame_v, torch.Tensor)
-            and gpu_k_slots.ndim == 5
-            and gpu_v_slots.ndim == 5
-            and frame_k.ndim == 4
-            and frame_v.ndim == 4
-            and frame_k.device == gpu_k_slots.device
-            and frame_v.device == gpu_v_slots.device
-        ):
-            return
-        frame_seqlen = int(frame_seqlen)
-        source_start = int(source_start_index)
-        source_token_count = min(int(frame_k.shape[1]), int(frame_v.shape[1]))
-        start = max(0, int(start_frame))
-        end = max(start, int(end_frame))
-        if frame_seqlen <= 0 or source_token_count <= 0 or start >= end:
-            return
-        frame_first = max(start, (source_start + frame_seqlen - 1) // frame_seqlen)
-        frame_last = min(end, (source_start + source_token_count) // frame_seqlen)
-        if frame_first >= frame_last:
-            return
-        num_heads = min(int(frame_k.shape[2]), int(frame_v.shape[2]), int(gpu_k_slots.shape[1]))
-        if num_heads <= 0:
-            return
-        frame_ids = torch.arange(frame_first, frame_last, dtype=torch.long)
-        slots = torch.remainder(frame_ids, gpu_cache_frames)
-        heads = torch.arange(num_heads, dtype=torch.long).repeat(int(frame_ids.numel()))
-        frames = frame_ids.repeat_interleave(num_heads)
-        slots_flat = slots.repeat_interleave(num_heads)
-
-        def _copy_rolling_frames() -> None:
-            for frame_id, slot_id in zip(frame_ids.tolist(), slots.tolist()):
-                rel_start = int(frame_id) * frame_seqlen - source_start
-                rel_end = rel_start + frame_seqlen
-                if rel_start < 0 or rel_end > source_token_count:
-                    continue
-                k_src = frame_k[:, rel_start:rel_end, :num_heads, :].reshape(
-                    int(frame_k.shape[0]), 1, frame_seqlen, num_heads, int(frame_k.shape[-1])
-                ).permute(0, 3, 1, 2, 4)
-                v_src = frame_v[:, rel_start:rel_end, :num_heads, :].reshape(
-                    int(frame_v.shape[0]), 1, frame_seqlen, num_heads, int(frame_v.shape[-1])
-                ).permute(0, 3, 1, 2, 4)
-                gpu_k_slots[:, :num_heads, int(slot_id):int(slot_id) + 1].copy_(k_src, non_blocking=True)
-                gpu_v_slots[:, :num_heads, int(slot_id):int(slot_id) + 1].copy_(v_src, non_blocking=True)
-
-        copy_stream = _shared_cuda_stream(device=gpu_k_slots.device, name="clean_kv_gpu_rolling")
-        copy_done: torch.cuda.Event | None = None
-        if copy_stream is not None and torch.cuda.is_available() and gpu_k_slots.device.type == "cuda":
-            if producer_event is None:
-                producer_event = _kv_cache_stream_ready_event(frame_k.device)
-            with torch.cuda.device(gpu_k_slots.device):
-                with torch.cuda.stream(copy_stream):
-                    if producer_event is not None:
-                        copy_stream.wait_event(producer_event)
-                    with _nvtx_range(kv_cache, "horizonkv.clean_kv_gpu_rolling_d2d"):
-                        _copy_rolling_frames()
-                    copy_done = torch.cuda.Event()
-                    copy_done.record(copy_stream)
-            frame_k.record_stream(copy_stream)
-            frame_v.record_stream(copy_stream)
-        else:
-            _copy_rolling_frames()
-        total_tokens = int(cpu_k.shape[2] if bool(kv_cache.get("cpu_cache_head_major", False)) else cpu_k.shape[1])
-        heads = _pin_cpu_tensor_if_available(heads.contiguous())
-        frames = _pin_cpu_tensor_if_available(frames.contiguous())
-        slots_flat = _pin_cpu_tensor_if_available(slots_flat.contiguous())
-        if copy_done is not None:
-            _kv_cache_queue_slot_metadata_commit(
-                kv_cache, head_ids=heads, slot_ids=slots_flat, frame_ids=frames,
-                frame_seqlen=frame_seqlen, total_tokens=total_tokens,
-                ready_event=copy_done, device=gpu_k_slots.device,
-            )
-        else:
-            _kv_cache_update_slot_metadata_fast(
-                kv_cache, head_ids=heads, slot_ids=slots_flat, frame_ids=frames,
-                frame_seqlen=frame_seqlen, total_tokens=total_tokens,
-            )
-        kv_cache["gpu_identity_filled_frames"] = 0
-        kv_cache["_kv_sparse_clean_gpu_identity_fill_scheduled_frames"] = 0
-        return
-
     committed_identity = max(0, int(kv_cache.get("gpu_identity_filled_frames", 0) or 0))
     scheduled_identity = max(
         committed_identity,
         int(
-            kv_cache.get(
-                "_kv_sparse_clean_gpu_identity_fill_scheduled_frames",
-                committed_identity,
-            )
+            kv_cache.get("_kv_sparse_clean_gpu_identity_fill_scheduled_frames", committed_identity)
             or 0
         ),
     )
@@ -1541,10 +1041,10 @@ def update_gpu_kv_cache_frames(
     if (
         not isinstance(gpu_k, torch.Tensor)
         or not isinstance(gpu_v, torch.Tensor)
-        or not isinstance(frame_k, torch.Tensor)
-        or not isinstance(frame_v, torch.Tensor)
-        or frame_k.device != gpu_k.device
-        or frame_v.device != gpu_v.device
+        or (not isinstance(frame_k, torch.Tensor))
+        or (not isinstance(frame_v, torch.Tensor))
+        or (frame_k.device != gpu_k.device)
+        or (frame_v.device != gpu_v.device)
     ):
         return
     slot_state = _kv_cache_slot_state_tensors(kv_cache)
@@ -1558,14 +1058,11 @@ def update_gpu_kv_cache_frames(
         return
     if int(frame_k.shape[1]) <= 0 or int(frame_k.shape[2]) <= 0:
         return
-
     start = max(0, int(start_frame))
     end = max(start, int(end_frame))
     if start >= end:
         return
-
-    head_major = bool(kv_cache.get("cpu_cache_head_major", False))
-    total_tokens = int(cpu_k.shape[2] if head_major else cpu_k.shape[1])
+    total_tokens = int(cpu_k.shape[2])
     source_start = int(source_start_index)
     source_token_count = int(frame_k.shape[1])
     num_heads = min(
@@ -1576,7 +1073,6 @@ def update_gpu_kv_cache_frames(
     )
     if num_heads <= 0:
         return
-
     frame_capacity = int(slot_state[0].shape[1])
     fill_start = int(identity_start)
     if start > fill_start:
@@ -1595,7 +1091,6 @@ def update_gpu_kv_cache_frames(
     fill_end = fill_start + frame_count
     rel_end = rel_start + frame_count * frame_seqlen
     identity_fill_end = fill_end
-
     frame_ids_cpu = torch.arange(fill_start, fill_end, dtype=torch.long)
     heads_cpu = torch.arange(num_heads, dtype=torch.long).repeat(frame_count)
     frames_cpu = frame_ids_cpu.repeat_interleave(num_heads)
@@ -1607,21 +1102,15 @@ def update_gpu_kv_cache_frames(
     use_slot_layout = (
         isinstance(gpu_k_slots, torch.Tensor)
         and isinstance(gpu_v_slots, torch.Tensor)
-        and gpu_k_slots.device == gpu_k.device
-        and gpu_v_slots.device == gpu_v.device
-        and gpu_k_slots.ndim == 5
-        and gpu_v_slots.ndim == 5
+        and (gpu_k_slots.device == gpu_k.device)
+        and (gpu_v_slots.device == gpu_v.device)
+        and (gpu_k_slots.ndim == 5)
+        and (gpu_v_slots.ndim == 5)
     )
 
     def _record_scheduled_identity_fill() -> None:
         kv_cache["_kv_sparse_clean_gpu_identity_fill_scheduled_frames"] = max(
-            int(
-                kv_cache.get(
-                    "_kv_sparse_clean_gpu_identity_fill_scheduled_frames",
-                    0,
-                )
-                or 0
-            ),
+            int(kv_cache.get("_kv_sparse_clean_gpu_identity_fill_scheduled_frames", 0) or 0),
             int(identity_fill_end),
         )
 
@@ -1643,28 +1132,24 @@ def update_gpu_kv_cache_frames(
             gpu_k_slots[:, :num_heads, fill_start:fill_end].copy_(k_src, non_blocking=True)
             gpu_v_slots[:, :num_heads, fill_start:fill_end].copy_(v_src, non_blocking=True)
             return
-
         slot_len = frame_count * frame_seqlen
         for head_id in range(num_heads):
             slot_start = (head_id * gpu_cache_frames + fill_start) * frame_seqlen
-            gpu_k[:, slot_start:slot_start + slot_len].copy_(
-                frame_k[:, rel_start:rel_end, head_id:head_id + 1, :],
-                non_blocking=True,
+            gpu_k[:, slot_start : slot_start + slot_len].copy_(
+                frame_k[:, rel_start:rel_end, head_id : head_id + 1, :], non_blocking=True
             )
-            gpu_v[:, slot_start:slot_start + slot_len].copy_(
-                frame_v[:, rel_start:rel_end, head_id:head_id + 1, :],
-                non_blocking=True,
+            gpu_v[:, slot_start : slot_start + slot_len].copy_(
+                frame_v[:, rel_start:rel_end, head_id : head_id + 1, :], non_blocking=True
             )
 
-    if copy_stream is not None and torch.cuda.is_available() and gpu_k.device.type == "cuda":
+    if copy_stream is not None and torch.cuda.is_available() and (gpu_k.device.type == "cuda"):
         if producer_event is None:
             producer_event = _kv_cache_stream_ready_event(frame_k.device)
         with torch.cuda.device(gpu_k.device):
             with torch.cuda.stream(copy_stream):
                 if producer_event is not None:
                     copy_stream.wait_event(producer_event)
-                with _nvtx_range(kv_cache, "horizonkv.clean_kv_gpu_fill_capacity_d2d"):
-                    _copy_identity_frames()
+                _copy_identity_frames()
                 copy_done = torch.cuda.Event()
                 copy_done.record(copy_stream)
         frame_k.record_stream(copy_stream)
@@ -1682,9 +1167,7 @@ def update_gpu_kv_cache_frames(
             identity_fill_end=identity_fill_end,
         ):
             return
-
-    with _nvtx_range(kv_cache, "horizonkv.clean_kv_gpu_fill_capacity_d2d"):
-        _copy_identity_frames()
+    _copy_identity_frames()
     metadata_committed = _kv_cache_update_slot_metadata_fast(
         kv_cache,
         head_ids=heads_cpu,
@@ -1696,14 +1179,13 @@ def update_gpu_kv_cache_frames(
     )
     if metadata_committed and identity_fill_end is not None:
         kv_cache["gpu_identity_filled_frames"] = max(
-            int(kv_cache.get("gpu_identity_filled_frames", 0) or 0),
-            identity_fill_end,
+            int(kv_cache.get("gpu_identity_filled_frames", 0) or 0), identity_fill_end
         )
         _record_scheduled_identity_fill()
 
 
 def _kv_cache_pending_cpu_copy_records(
-    kv_cache: dict[str, Any],
+    kv_cache: dict[str, Any]
 ) -> list[tuple[torch.cuda.Event, tuple[int, int]]]:
     records = kv_cache.get("cpu_copy_records", None)
     if isinstance(records, list) and records:
@@ -1767,18 +1249,16 @@ def _kv_cache_pending_cpu_copy_records(
 
 
 def _kv_cache_set_pending_cpu_copy_records(
-    kv_cache: dict[str, Any],
-    records: list[tuple[torch.cuda.Event, tuple[int, int]]],
+    kv_cache: dict[str, Any], records: list[tuple[torch.cuda.Event, tuple[int, int]]]
 ) -> None:
     if records:
         kv_cache["cpu_copy_records"] = [
-            (event, (int(span[0]), int(span[1])))
-            for event, span in records
+            (event, (int(span[0]), int(span[1]))) for event, span in records
         ]
         last_event, last_span = records[-1]
         kv_cache["cpu_copy_event"] = last_event
-        kv_cache["cpu_copy_range"] = tuple(int(v) for v in last_span)
-        kv_cache["cpu_copy_ranges"] = [tuple(int(v) for v in span) for _, span in records]
+        kv_cache["cpu_copy_range"] = tuple((int(v) for v in last_span))
+        kv_cache["cpu_copy_ranges"] = [tuple((int(v) for v in span)) for _, span in records]
     else:
         kv_cache["cpu_copy_records"] = []
         kv_cache["cpu_copy_event"] = None
@@ -1791,63 +1271,19 @@ def _kv_cache_wait_pending_cpu_copy(kv_cache: dict[str, Any]) -> None:
     if not records or not torch.cuda.is_available():
         return
     gpu_k = kv_cache.get("gpu_k", None)
-    device = gpu_k.device if isinstance(gpu_k, torch.Tensor) and gpu_k.device.type == "cuda" else None
-    if device is None:
-        frame_stats = kv_cache.get("frame_k_mean", None)
-        if isinstance(frame_stats, torch.Tensor) and frame_stats.device.type == "cuda":
-            device = frame_stats.device
-    if device is None:
-        return
-    current_stream = torch.cuda.current_stream(device)
-    with _nvtx_range(kv_cache, "horizonkv.cpu_copy_wait"):
-        for event, _ in records:
-            current_stream.wait_event(event)
-    _kv_cache_set_pending_cpu_copy_records(kv_cache, [])
-
-
-def _kv_cache_wait_pending_cpu_copy_matching(
-    kv_cache: dict[str, Any],
-    predicate,
-) -> None:
-    records = _kv_cache_pending_cpu_copy_records(kv_cache)
-    if not records or not torch.cuda.is_available():
-        return
-    gpu_k = kv_cache.get("gpu_k", None)
-    device = gpu_k.device if isinstance(gpu_k, torch.Tensor) and gpu_k.device.type == "cuda" else None
-    if device is None:
-        frame_stats = kv_cache.get("frame_k_mean", None)
-        if isinstance(frame_stats, torch.Tensor) and frame_stats.device.type == "cuda":
-            device = frame_stats.device
-    if device is None:
-        return
-    current_stream = torch.cuda.current_stream(device)
-    matched: list[tuple[torch.cuda.Event, tuple[int, int]]] = []
-    remaining: list[tuple[torch.cuda.Event, tuple[int, int]]] = []
-    for event, span in records:
-        if predicate(int(span[0]), int(span[1])):
-            matched.append((event, span))
-        else:
-            remaining.append((event, span))
-    if not matched:
-        return
-    with _nvtx_range(kv_cache, "horizonkv.cpu_copy_wait"):
-        for event, _ in matched:
-            current_stream.wait_event(event)
-    if matched:
-        _kv_cache_set_pending_cpu_copy_records(kv_cache, remaining)
-
-
-def _kv_cache_wait_pending_cpu_copy_for_range(
-    kv_cache: dict[str, Any],
-    start: int,
-    end: int,
-) -> None:
-    if int(start) >= int(end):
-        return
-    _kv_cache_wait_pending_cpu_copy_matching(
-        kv_cache,
-        lambda p0, p1: int(start) < p1 and p0 < int(end),
+    device = (
+        gpu_k.device if isinstance(gpu_k, torch.Tensor) and gpu_k.device.type == "cuda" else None
     )
+    if device is None:
+        frame_stats = kv_cache.get("frame_k_mean", None)
+        if isinstance(frame_stats, torch.Tensor) and frame_stats.device.type == "cuda":
+            device = frame_stats.device
+    if device is None:
+        return
+    current_stream = torch.cuda.current_stream(device)
+    for event, _ in records:
+        current_stream.wait_event(event)
+    _kv_cache_set_pending_cpu_copy_records(kv_cache, [])
 
 
 def copy_kv_to_cpu_cache_async(
@@ -1859,40 +1295,31 @@ def copy_kv_to_cpu_cache_async(
     value: torch.Tensor,
     producer_event: torch.cuda.Event | None = None,
 ) -> None:
-    """Write clean KV to pinned CPU cache without blocking the compute stream."""
     start = int(local_start_index)
     end = int(local_end_index)
     if start >= end:
         return
     cpu_k = kv_cache["cpu_k"]
     cpu_v = kv_cache["cpu_v"]
-    head_major = bool(kv_cache.get("cpu_cache_head_major", False))
 
     def copy_fallback() -> None:
-        if head_major:
-            cpu_k[:, :, start:end].copy_(key.detach().permute(0, 2, 1, 3), non_blocking=True)
-            cpu_v[:, :, start:end].copy_(value.detach().permute(0, 2, 1, 3), non_blocking=True)
-        else:
-            cpu_k[:, start:end].copy_(key.detach(), non_blocking=True)
-            cpu_v[:, start:end].copy_(value.detach(), non_blocking=True)
+        cpu_k[:, :, start:end].copy_(key.detach().permute(0, 2, 1, 3), non_blocking=True)
+        cpu_v[:, :, start:end].copy_(value.detach().permute(0, 2, 1, 3), non_blocking=True)
 
     if (
-        not bool(kv_cache.get("cpu_offload_kv", False))
-        or key.device.type != "cuda"
+        key.device.type != "cuda"
         or value.device != key.device
-        or not torch.cuda.is_available()
-        or not (cpu_k.is_pinned() and cpu_v.is_pinned())
+        or (not torch.cuda.is_available())
+        or (not (cpu_k.is_pinned() and cpu_v.is_pinned()))
     ):
         copy_fallback()
         _kv_cache_set_pending_cpu_copy_records(kv_cache, [])
         return
-
     stream = _kv_cache_cpu_copy_stream(kv_cache, key.device)
     if stream is None:
         copy_fallback()
         _kv_cache_set_pending_cpu_copy_records(kv_cache, [])
         return
-
     if producer_event is None:
         producer_event = _kv_cache_stream_ready_event(key.device)
     key_detached = key.detach()
@@ -1900,26 +1327,20 @@ def copy_kv_to_cpu_cache_async(
     if producer_event is not None:
         stream.wait_event(producer_event)
     with torch.cuda.stream(stream):
-        with _nvtx_range(kv_cache, "horizonkv.clean_kv_d2h"):
+        copied = 0
+        try:
+            copied = copy_kv_span_to_cpu_cache(
+                gpu_k_span=key_detached,
+                gpu_v_span=value_detached,
+                cpu_k=cpu_k,
+                cpu_v=cpu_v,
+                start_token=start,
+            )
+        except Exception:
             copied = 0
-            if copy_kv_span_to_cpu_cache is not None:
-                try:
-                    copied = copy_kv_span_to_cpu_cache(
-                        gpu_k_span=key_detached,
-                        gpu_v_span=value_detached,
-                        cpu_k=cpu_k,
-                        cpu_v=cpu_v,
-                        start_token=start,
-                    )
-                except Exception:
-                    copied = 0
-            if copied <= 0:
-                if head_major:
-                    cpu_k[:, :, start:end].copy_(key_detached.permute(0, 2, 1, 3), non_blocking=True)
-                    cpu_v[:, :, start:end].copy_(value_detached.permute(0, 2, 1, 3), non_blocking=True)
-                else:
-                    cpu_k[:, start:end].copy_(key_detached, non_blocking=True)
-                    cpu_v[:, start:end].copy_(value_detached, non_blocking=True)
+        if copied <= 0:
+            cpu_k[:, :, start:end].copy_(key_detached.permute(0, 2, 1, 3), non_blocking=True)
+            cpu_v[:, :, start:end].copy_(value_detached.permute(0, 2, 1, 3), non_blocking=True)
         event = torch.cuda.Event()
         event.record(stream)
     key_detached.record_stream(stream)
@@ -1941,12 +1362,10 @@ def queue_deferred_clean_kv_to_cpu_cache(
 ) -> bool:
     queue_kv_cache = next_kv_cache if isinstance(next_kv_cache, dict) else kv_cache
     if (
-        not _defer_clean_d2h_enabled_by_env()
-        or not isinstance(queue_kv_cache, dict)
-        or not bool(kv_cache.get("cpu_offload_kv", False))
+        not isinstance(queue_kv_cache, dict)
         or key.device.type != "cuda"
         or value.device != key.device
-        or not torch.cuda.is_available()
+        or (not torch.cuda.is_available())
     ):
         return False
     start = int(local_start_index)
@@ -1967,28 +1386,31 @@ def queue_deferred_clean_kv_to_cpu_cache(
 
 
 def flush_deferred_clean_kv_offloads(kv_cache: dict[str, Any] | None) -> None:
-    with _nvtx_range(kv_cache, "horizonkv.clean_kv_d2h_submit_before_attn"):
-        if not isinstance(kv_cache, dict):
-            return
-        records = kv_cache.pop("_deferred_clean_kv_offloads", None)
-        if not records:
-            return
-        for record in records:
-            if not isinstance(record, dict):
-                continue
-            target = record.get("target_kv_cache", None)
-            key = record.get("key", None)
-            value = record.get("value", None)
-            if not isinstance(target, dict) or not isinstance(key, torch.Tensor) or not isinstance(value, torch.Tensor):
-                continue
-            copy_kv_to_cpu_cache_async(
-                target,
-                local_start_index=int(record.get("local_start_index", 0)),
-                local_end_index=int(record.get("local_end_index", 0)),
-                key=key,
-                value=value,
-                producer_event=record.get("producer_event", None),
-            )
+    if not isinstance(kv_cache, dict):
+        return
+    records = kv_cache.pop("_deferred_clean_kv_offloads", None)
+    if not records:
+        return
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        target = record.get("target_kv_cache", None)
+        key = record.get("key", None)
+        value = record.get("value", None)
+        if (
+            not isinstance(target, dict)
+            or not isinstance(key, torch.Tensor)
+            or (not isinstance(value, torch.Tensor))
+        ):
+            continue
+        copy_kv_to_cpu_cache_async(
+            target,
+            local_start_index=int(record.get("local_start_index", 0)),
+            local_end_index=int(record.get("local_end_index", 0)),
+            key=key,
+            value=value,
+            producer_event=record.get("producer_event", None),
+        )
 
 
 def _kv_cache_copy_frame_tensor_plan_from_cpu_to_slots(
@@ -2009,46 +1431,36 @@ def _kv_cache_copy_frame_tensor_plan_from_cpu_to_slots(
     frame_indices_cpu = frame_indices_cpu.contiguous()
     slot_plan_cpu = slot_plan_cpu.contiguous()
     copy_plan_cpu = copy_plan_cpu.contiguous()
-
     if expected_copies is None:
         expected_copies = int(copy_plan_cpu.ne(0).sum().item())
     else:
         expected_copies = int(expected_copies)
     if expected_copies <= 0:
         return True
-
-    # Prefer one batched CUDA copy to avoid thousands of tiny H2D launches.
-    # The extension path still falls back automatically when unavailable.
-    batched_h2d_enabled = _truthy_env("HORIZONKV_BATCHED_H2D", "1")
-    if (
-        batched_h2d_enabled
-        and copy_kv_frame_plan_to_gpu_slots_batched is not None
-        and gpu_k.device.type == "cuda"
-    ):
+    if gpu_k.device.type == "cuda":
         try:
             with torch.cuda.stream(stream):
-                with _nvtx_range(kv_cache, "horizonkv.copy_h2d_batch"):
-                    copied = copy_kv_frame_plan_to_gpu_slots_batched(
-                        cpu_k=cpu_k,
-                        cpu_v=cpu_v,
-                        gpu_k=gpu_k,
-                        gpu_v=gpu_v,
-                        frame_indices=frame_indices_cpu,
-                        slot_plan=slot_plan_cpu,
-                        copy_plan=copy_plan_cpu,
-                        frame_seqlen=frame_seqlen,
-                        gpu_cache_frames=int(kv_cache.get("gpu_cache_frames", 0) or 0),
-                    )
+                copied = copy_kv_frame_plan_to_gpu_slots_batched(
+                    cpu_k=cpu_k,
+                    cpu_v=cpu_v,
+                    gpu_k=gpu_k,
+                    gpu_v=gpu_v,
+                    frame_indices=frame_indices_cpu,
+                    slot_plan=slot_plan_cpu,
+                    copy_plan=copy_plan_cpu,
+                    frame_seqlen=frame_seqlen,
+                    gpu_cache_frames=int(kv_cache.get("gpu_cache_frames", 0) or 0),
+                )
             if int(copied) == expected_copies:
                 return True
-            if (
-                bool(kv_cache.get("cpu_cache_head_major", False))
-                and str(os.getenv("HORIZONKV_FUSED_ONLOAD_VERBOSE", "0")).strip().lower()
-                in ("1", "true", "yes", "on")
+            if str(os.getenv("HORIZONKV_FUSED_ONLOAD_VERBOSE", "0")).strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
             ):
                 print(
-                    "[horizonkv] head-major batch H2D did not copy full plan: "
-                    f"copied={int(copied)} expected={expected_copies}"
+                    f"[horizonkv] head-major batch H2D did not copy full plan: copied={int(copied)} expected={expected_copies}"
                 )
         except Exception as exc:
             if str(os.getenv("HORIZONKV_FUSED_ONLOAD_VERBOSE", "0")).strip().lower() in (
@@ -2058,25 +1470,20 @@ def _kv_cache_copy_frame_tensor_plan_from_cpu_to_slots(
                 "on",
             ):
                 print(f"[horizonkv] CUDA batch H2D fallback after failure: {exc}")
-
-    if (
-        copy_kv_frame_plan_to_gpu_slots is not None
-        and gpu_k.device.type == "cuda"
-    ):
+    if gpu_k.device.type == "cuda":
         try:
             with torch.cuda.stream(stream):
-                with _nvtx_range(kv_cache, "horizonkv.copy_h2d"):
-                    copied = copy_kv_frame_plan_to_gpu_slots(
-                        cpu_k=cpu_k,
-                        cpu_v=cpu_v,
-                        gpu_k=gpu_k,
-                        gpu_v=gpu_v,
-                        frame_indices=frame_indices_cpu,
-                        slot_plan=slot_plan_cpu,
-                        copy_plan=copy_plan_cpu,
-                        frame_seqlen=frame_seqlen,
-                        gpu_cache_frames=int(kv_cache.get("gpu_cache_frames", 0) or 0),
-                    )
+                copied = copy_kv_frame_plan_to_gpu_slots(
+                    cpu_k=cpu_k,
+                    cpu_v=cpu_v,
+                    gpu_k=gpu_k,
+                    gpu_v=gpu_v,
+                    frame_indices=frame_indices_cpu,
+                    slot_plan=slot_plan_cpu,
+                    copy_plan=copy_plan_cpu,
+                    frame_seqlen=frame_seqlen,
+                    gpu_cache_frames=int(kv_cache.get("gpu_cache_frames", 0) or 0),
+                )
             if int(copied) == expected_copies:
                 return True
         except Exception as exc:
@@ -2087,544 +1494,7 @@ def _kv_cache_copy_frame_tensor_plan_from_cpu_to_slots(
                 "on",
             ):
                 print(f"[horizonkv] batched frame copy fallback after failure: {exc}")
-
     return False
-
-def _materialize_full_kv_from_cpu_cache(
-    kv_cache: dict[str, Any],
-    Lk: int,
-    device: torch.device,
-    *,
-    live_k: torch.Tensor | None = None,
-    live_v: torch.Tensor | None = None,
-    live_start_index: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    cpu_k = kv_cache["cpu_k"]
-    cpu_v = kv_cache["cpu_v"]
-    head_major = bool(kv_cache.get("cpu_cache_head_major", False))
-    token_dim = 2 if head_major else 1
-    Lk = max(0, min(int(Lk), int(cpu_k.shape[token_dim])))
-
-    def cpu_slice(tensor: torch.Tensor, start: int, end: int) -> torch.Tensor:
-        if head_major:
-            return tensor[:, :, start:end].permute(0, 2, 1, 3).to(
-                device=device,
-                non_blocking=True,
-            )
-        return tensor[:, start:end].to(device=device, non_blocking=True)
-
-    def live_slice(tensor: torch.Tensor, start: int, end: int) -> torch.Tensor:
-        assert live_start_index is not None
-        return tensor[:, start - int(live_start_index):end - int(live_start_index)]
-
-    if live_k is None or live_v is None or live_start_index is None:
-        _kv_cache_wait_pending_cpu_copy_for_range(kv_cache, 0, Lk)
-        return cpu_slice(cpu_k, 0, Lk), cpu_slice(cpu_v, 0, Lk)
-
-    live_start = max(0, int(live_start_index))
-    live_end = min(Lk, live_start + int(live_k.shape[1]))
-    if live_start >= live_end:
-        _kv_cache_wait_pending_cpu_copy_for_range(kv_cache, 0, Lk)
-        return cpu_slice(cpu_k, 0, Lk), cpu_slice(cpu_v, 0, Lk)
-
-    k_parts: list[torch.Tensor] = []
-    v_parts: list[torch.Tensor] = []
-    if live_start > 0:
-        _kv_cache_wait_pending_cpu_copy_for_range(kv_cache, 0, live_start)
-        k_parts.append(cpu_slice(cpu_k, 0, live_start))
-        v_parts.append(cpu_slice(cpu_v, 0, live_start))
-    k_parts.append(live_slice(live_k, live_start, live_end))
-    v_parts.append(live_slice(live_v, live_start, live_end))
-    if live_end < Lk:
-        _kv_cache_wait_pending_cpu_copy_for_range(kv_cache, live_end, Lk)
-        k_parts.append(cpu_slice(cpu_k, live_end, Lk))
-        v_parts.append(cpu_slice(cpu_v, live_end, Lk))
-
-    return torch.cat(k_parts, dim=1), torch.cat(v_parts, dim=1)
-
-
-def materialize_selected_kv_frames_from_cpu_cache(
-    kv_cache: dict[str, Any],
-    frame_indices: torch.Tensor,
-    *,
-    frame_seqlen: int,
-    Lk: int,
-    device: torch.device,
-    live_k: torch.Tensor | None = None,
-    live_v: torch.Tensor | None = None,
-    live_start_index: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Gather per-head [H,S] frame selections as chronological raw [B,S*frame_seqlen,H,D] KV."""
-    if not isinstance(frame_indices, torch.Tensor) or frame_indices.ndim != 2:
-        raise ValueError("frame_indices must have shape [heads, selected_frames]")
-    if int(frame_seqlen) <= 0 or int(Lk) <= 0:
-        raise ValueError("frame_seqlen and Lk must be positive")
-    cpu_k = kv_cache.get("cpu_k", None)
-    cpu_v = kv_cache.get("cpu_v", None)
-    if not isinstance(cpu_k, torch.Tensor) or not isinstance(cpu_v, torch.Tensor):
-        raise RuntimeError("CPU KV cache tensors are unavailable")
-    if tuple(cpu_k.shape) != tuple(cpu_v.shape):
-        raise RuntimeError("CPU K/V cache shapes do not match")
-
-    frame_indices_cpu = frame_indices.detach().to(device="cpu", dtype=torch.long).contiguous()
-    B = int(cpu_k.shape[0])
-    H = int(frame_indices_cpu.shape[0])
-    D = int(cpu_k.shape[-1])
-    head_major = bool(kv_cache.get("cpu_cache_head_major", False))
-    capacity = int(cpu_k.shape[2] if head_major else cpu_k.shape[1])
-    valid_Lk = min(int(Lk), capacity)
-    n_frames = (valid_Lk + int(frame_seqlen) - 1) // int(frame_seqlen)
-    selected_count = int(frame_indices_cpu.shape[1])
-    if H <= 0 or selected_count <= 0:
-        empty = torch.empty((B, 0, H, D), device=device, dtype=cpu_k.dtype)
-        return empty, empty
-
-    k_heads: list[torch.Tensor] = []
-    v_heads: list[torch.Tensor] = []
-    packed_spans: list[list[tuple[int, int, int]]] = []
-    for h in range(H):
-        k_parts: list[torch.Tensor] = []
-        v_parts: list[torch.Tensor] = []
-        spans: list[tuple[int, int, int]] = []
-        packed_offset = 0
-        for frame in frame_indices_cpu[h].tolist():
-            frame_id = max(0, min(int(frame), n_frames - 1))
-            start = frame_id * int(frame_seqlen)
-            end = min(valid_Lk, start + int(frame_seqlen))
-            if start >= end:
-                continue
-            _kv_cache_wait_pending_cpu_copy_for_range(kv_cache, start, end)
-            if head_major:
-                k_part = cpu_k[:, h, start:end, :].unsqueeze(2)
-                v_part = cpu_v[:, h, start:end, :].unsqueeze(2)
-            else:
-                k_part = cpu_k[:, start:end, h : h + 1, :]
-                v_part = cpu_v[:, start:end, h : h + 1, :]
-            k_parts.append(k_part)
-            v_parts.append(v_part)
-            spans.append((packed_offset, start, end))
-            packed_offset += end - start
-        if not k_parts:
-            k_heads.append(torch.zeros((B, 0, 1, D), dtype=cpu_k.dtype))
-            v_heads.append(torch.zeros((B, 0, 1, D), dtype=cpu_v.dtype))
-        else:
-            k_heads.append(torch.cat(k_parts, dim=1))
-            v_heads.append(torch.cat(v_parts, dim=1))
-        packed_spans.append(spans)
-
-    # Pad any partial final frames to a common width before stacking heads.
-    packed_tokens = max((int(t.shape[1]) for t in k_heads), default=0)
-    pin_output = bool(
-        _pin_cpu_cache_enabled_by_env()
-        and device.type == "cuda"
-        and torch.cuda.is_available()
-    )
-    try:
-        k_out = torch.zeros(
-            (B, packed_tokens, H, D), dtype=cpu_k.dtype, pin_memory=pin_output
-        )
-    except RuntimeError:
-        # CPU-only smoke tests and containers without a pinned-memory allocator
-        # still use the same semantic path, with a synchronous H2D fallback.
-        k_out = torch.zeros((B, packed_tokens, H, D), dtype=cpu_k.dtype)
-    v_out = torch.zeros_like(k_out)
-    for h, (kh, vh) in enumerate(zip(k_heads, v_heads)):
-        width = int(kh.shape[1])
-        if width:
-            k_out[:, :width, h : h + 1, :] = kh
-            v_out[:, :width, h : h + 1, :] = vh
-
-    # The current block may still be live on GPU and not yet copied to CPU.
-    # Overlay those tokens after the selective H2D transfer.
-    if (
-        isinstance(live_k, torch.Tensor)
-        and isinstance(live_v, torch.Tensor)
-        and live_start_index is not None
-        and live_k.ndim == 4
-        and live_v.shape == live_k.shape
-    ):
-        live_start = int(live_start_index)
-        live_end = min(valid_Lk, live_start + int(live_k.shape[1]))
-        if live_start < live_end:
-            for h, spans in enumerate(packed_spans):
-                for packed_start, frame_start, frame_end in spans:
-                    overlap_start = max(frame_start, live_start)
-                    overlap_end = min(frame_end, live_end)
-                    if overlap_start >= overlap_end:
-                        continue
-                    dst_start = packed_start + overlap_start - frame_start
-                    src_start = overlap_start - live_start
-                    length = overlap_end - overlap_start
-                    k_out[:, dst_start : dst_start + length, h : h + 1, :] = live_k[
-                        :, src_start : src_start + length, h : h + 1, :
-                    ].to(device="cpu")
-                    v_out[:, dst_start : dst_start + length, h : h + 1, :] = live_v[
-                        :, src_start : src_start + length, h : h + 1, :
-                    ].to(device="cpu")
-
-    return (
-        k_out.to(device=device, non_blocking=True),
-        v_out.to(device=device, non_blocking=True),
-    )
-
-
-def _materialize_selected_kv_frames_from_resident_slots(
-    kv_cache: dict[str, Any],
-    *,
-    frame_indices_device: torch.Tensor,
-    slot_indices_device: torch.Tensor,
-    frame_seqlen: int,
-    total_tokens: int,
-    live_k: torch.Tensor | None,
-    live_v: torch.Tensor | None,
-    live_start_index: int | None,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Gather a selected raw-KV window from an already-resolved slot plan."""
-    gpu_k_slots = kv_cache.get("gpu_k_slots", None)
-    gpu_v_slots = kv_cache.get("gpu_v_slots", None)
-    if (
-        not isinstance(gpu_k_slots, torch.Tensor)
-        or not isinstance(gpu_v_slots, torch.Tensor)
-        or tuple(gpu_k_slots.shape) != tuple(gpu_v_slots.shape)
-        or frame_indices_device.device != gpu_k_slots.device
-        or slot_indices_device.device != gpu_k_slots.device
-        or frame_indices_device.dtype != torch.long
-        or slot_indices_device.dtype != torch.long
-        or frame_indices_device.ndim != 2
-        or tuple(slot_indices_device.shape) != tuple(frame_indices_device.shape)
-    ):
-        return None
-
-    B = int(gpu_k_slots.shape[0])
-    H = int(frame_indices_device.shape[0])
-    selected_frames = int(frame_indices_device.shape[1])
-    D = int(gpu_k_slots.shape[-1])
-    gpu_cache_frames = int(gpu_k_slots.shape[2])
-    if H <= 0 or selected_frames <= 0 or int(frame_seqlen) <= 0:
-        return None
-    has_live = (
-        isinstance(live_k, torch.Tensor)
-        and isinstance(live_v, torch.Tensor)
-        and live_start_index is not None
-    )
-    head_indices_device = _all_head_indices_device(H, gpu_k_slots.device).contiguous()
-    frame_indices_device = frame_indices_device.contiguous()
-    slot_indices_device = slot_indices_device.contiguous()
-    token_count = selected_frames * int(frame_seqlen)
-
-    if fused_kv_frame_materialize is not None:
-        k_rows = torch.empty(
-            (B * H, token_count, 1, D),
-            device=gpu_k_slots.device,
-            dtype=gpu_k_slots.dtype,
-        )
-        v_rows = torch.empty_like(k_rows)
-        try:
-            fused_ok = fused_kv_frame_materialize(
-                gpu_k=kv_cache["gpu_k"],
-                gpu_v=kv_cache["gpu_v"],
-                k_out=k_rows,
-                v_out=v_rows,
-                head_indices=head_indices_device,
-                frame_indices=frame_indices_device,
-                slot_indices=slot_indices_device,
-                frame_seqlen=int(frame_seqlen),
-                total_tokens=int(total_tokens),
-                num_heads=H,
-                gpu_cache_frames=gpu_cache_frames,
-                live_k=live_k if has_live else None,
-                live_v=live_v if has_live else None,
-                live_start_index=int(live_start_index or 0),
-            )
-        except Exception:
-            fused_ok = False
-        if fused_ok:
-            return (
-                k_rows.reshape(B, H, token_count, 1, D)
-                .permute(0, 2, 1, 3, 4)
-                .reshape(B, token_count, H, D),
-                v_rows.reshape(B, H, token_count, 1, D)
-                .permute(0, 2, 1, 3, 4)
-                .reshape(B, token_count, H, D),
-            )
-
-    # Tensor fallback: gather historical slots and overlay live frames (slot -2).
-    slot_indices_safe = slot_indices_device.clamp_min(0)
-    head_indices_safe = head_indices_device.view(H, 1)
-    k_slots = gpu_k_slots[:, head_indices_safe, slot_indices_safe, :, :]
-    v_slots = gpu_v_slots[:, head_indices_safe, slot_indices_safe, :, :]
-    k_out = k_slots.permute(0, 2, 3, 1, 4).reshape(B, token_count, H, D).contiguous()
-    v_out = v_slots.permute(0, 2, 3, 1, 4).reshape(B, token_count, H, D).contiguous()
-
-    live_positions = (slot_indices_device == -2).nonzero(as_tuple=False)
-    if int(live_positions.shape[0]) > 0:
-        if not has_live or live_k is None or live_v is None:
-            return None
-        live_start = int(live_start_index)
-        for position in live_positions.tolist():
-            head_id, selected_id = int(position[0]), int(position[1])
-            frame_id = int(frame_indices_device[head_id, selected_id].item())
-            source_start = frame_id * int(frame_seqlen) - live_start
-            source_end = source_start + int(frame_seqlen)
-            if source_start < 0 or source_end > int(live_k.shape[1]):
-                return None
-            dst_start = selected_id * int(frame_seqlen)
-            dst_end = dst_start + int(frame_seqlen)
-            k_out[:, dst_start:dst_end, head_id : head_id + 1, :] = live_k[
-                :, source_start:source_end, head_id : head_id + 1, :
-            ]
-            v_out[:, dst_start:dst_end, head_id : head_id + 1, :] = live_v[
-                :, source_start:source_end, head_id : head_id + 1, :
-            ]
-    return k_out, v_out
-
-
-def materialize_selected_kv_frames_from_gpu_slots(
-    kv_cache: dict[str, Any],
-    frame_indices: torch.Tensor,
-    *,
-    frame_seqlen: int,
-    Lk: int,
-    device: torch.device,
-    live_k: torch.Tensor | None = None,
-    live_v: torch.Tensor | None = None,
-    live_start_index: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Fetch misses into GPU slots and gather raw selected KV before RoPE.
-
-    Return None when the slot backend or input geometry is unsupported."""
-    if not isinstance(frame_indices, torch.Tensor) or frame_indices.ndim != 2:
-        return None
-    if int(frame_seqlen) <= 0 or int(Lk) <= 0:
-        return None
-    if device.type != "cuda" or not torch.cuda.is_available():
-        return None
-    if plan_kv_frame_slots_tensor is None:
-        return None
-
-    gpu_k_slots = kv_cache.get("gpu_k_slots", None)
-    gpu_v_slots = kv_cache.get("gpu_v_slots", None)
-    if (
-        not isinstance(gpu_k_slots, torch.Tensor)
-        or not isinstance(gpu_v_slots, torch.Tensor)
-        or gpu_k_slots.device != device
-        or gpu_v_slots.device != device
-        or gpu_k_slots.ndim != 5
-        or tuple(gpu_k_slots.shape) != tuple(gpu_v_slots.shape)
-    ):
-        return None
-
-    cpu_k = kv_cache.get("cpu_k", None)
-    cpu_v = kv_cache.get("cpu_v", None)
-    if (
-        not isinstance(cpu_k, torch.Tensor)
-        or not isinstance(cpu_v, torch.Tensor)
-        or tuple(cpu_k.shape) != tuple(cpu_v.shape)
-    ):
-        return None
-
-    _kv_cache_wait_pending_slot_metadata_commit(kv_cache)
-    slot_state = _kv_cache_slot_state_tensors(kv_cache)
-    if slot_state is None:
-        return None
-    frame_indices_device = frame_indices.detach().to(device=device, dtype=torch.long).contiguous()
-    if int(frame_indices_device.shape[0]) != int(gpu_k_slots.shape[1]):
-        return None
-    selected_frames = int(frame_indices_device.shape[1])
-    if selected_frames <= 0:
-        return None
-
-    H = int(frame_indices_device.shape[0])
-    gpu_cache_frames = int(gpu_k_slots.shape[2])
-    total_tokens = int(cpu_k.shape[2] if bool(kv_cache.get("cpu_cache_head_major", False)) else cpu_k.shape[1])
-    has_live = (
-        isinstance(live_k, torch.Tensor)
-        and isinstance(live_v, torch.Tensor)
-        and live_start_index is not None
-    )
-    live_len = int(live_k.shape[1]) if isinstance(live_k, torch.Tensor) else 0
-
-    # Identity-resident history needs no selected-index D2H or CPU slot planning.
-    identity_slots = _identity_slot_indices_if_capacity_resident(
-        kv_cache,
-        frame_indices=frame_indices_device,
-        frame_seqlen=int(frame_seqlen),
-        gpu_cache_frames=gpu_cache_frames,
-        live_start_index=live_start_index if has_live else None,
-        live_len=live_len,
-    )
-    if identity_slots is not None:
-        identity_result = _materialize_selected_kv_frames_from_resident_slots(
-            kv_cache,
-            frame_indices_device=frame_indices_device,
-            slot_indices_device=identity_slots,
-            frame_seqlen=int(frame_seqlen),
-            total_tokens=total_tokens,
-            live_k=live_k,
-            live_v=live_v,
-            live_start_index=live_start_index,
-        )
-        if identity_result is not None:
-            return identity_result
-
-    # Reading the GPU miss flag synchronizes compute; keep this shortcut opt-in.
-    gpu_frame_to_slot_device = kv_cache.get("gpu_frame_to_slot_device", None)
-    identity_filled = int(kv_cache.get("gpu_identity_filled_frames", 0) or 0)
-    if (
-        _truthy_env("HORIZONKV_GPU_LOOKUP_ALL_HIT", "0")
-        and lookup_frame_slots_all_hit is not None
-        and isinstance(gpu_k_slots, torch.Tensor)
-        and isinstance(gpu_v_slots, torch.Tensor)
-        and identity_filled >= gpu_cache_frames
-        and isinstance(gpu_frame_to_slot_device, torch.Tensor)
-        and gpu_frame_to_slot_device.device == device
-        and gpu_frame_to_slot_device.dtype == torch.long
-        and gpu_frame_to_slot_device.is_contiguous()
-    ):
-        head_indices_device = _all_head_indices_device(H, device).contiguous()
-        try:
-            lookup_result = lookup_frame_slots_all_hit(
-                head_indices=head_indices_device,
-                frame_indices=frame_indices_device,
-                frame_to_slot=gpu_frame_to_slot_device,
-                total_tokens=total_tokens,
-                frame_seqlen=int(frame_seqlen),
-                num_heads=H,
-                gpu_cache_frames=gpu_cache_frames,
-                live_start_index=int(live_start_index or 0),
-                live_len=live_len,
-                has_live=bool(has_live),
-            )
-        except Exception:
-            lookup_result = None
-        if isinstance(lookup_result, tuple) and len(lookup_result) == 2:
-            lookup_slots, miss_flag = lookup_result
-            if (
-                isinstance(lookup_slots, torch.Tensor)
-                and isinstance(miss_flag, torch.Tensor)
-                and int(miss_flag.item()) == 0
-            ):
-                lookup_materialized = _materialize_selected_kv_frames_from_resident_slots(
-                    kv_cache,
-                    frame_indices_device=frame_indices_device,
-                    slot_indices_device=lookup_slots.contiguous(),
-                    frame_seqlen=int(frame_seqlen),
-                    total_tokens=total_tokens,
-                    live_k=live_k,
-                    live_v=live_v,
-                    live_start_index=live_start_index,
-                )
-                if lookup_materialized is not None:
-                    return lookup_materialized
-
-    frame_indices_cpu = frame_indices_device.to(device="cpu", dtype=torch.long).contiguous()
-
-    # Wait for deferred clean D2H before historical reads; live KV needs no wait.
-    pending_wait_spans: set[tuple[int, int]] = set()
-    live_lo = int(live_start_index or 0) if has_live else -1
-    live_hi = live_lo + live_len if has_live else -1
-    for frame_id in frame_indices_cpu.reshape(-1).tolist():
-        frame_id = int(frame_id)
-        if frame_id < 0:
-            continue
-        frame_start = frame_id * int(frame_seqlen)
-        frame_end = min(total_tokens, frame_start + int(frame_seqlen))
-        if frame_start >= frame_end:
-            continue
-        if has_live and frame_start >= live_lo and frame_end <= live_hi:
-            continue
-        pending_wait_spans.add((frame_start, frame_end))
-    for wait_start, wait_end in pending_wait_spans:
-        _kv_cache_wait_pending_cpu_copy_for_range(kv_cache, wait_start, wait_end)
-
-    plan_result = plan_kv_frame_slots_tensor(
-        frame_indices=frame_indices_cpu,
-        frame_to_slot=slot_state[0],
-        slot_frame_ids=slot_state[1],
-        slot_frame_lens=slot_state[2],
-        slot_last_used=slot_state[3],
-        total_tokens=total_tokens,
-        frame_seqlen=int(frame_seqlen),
-        num_heads=H,
-        gpu_cache_frames=gpu_cache_frames,
-        live_start_index=int(live_start_index or 0),
-        live_len=live_len,
-        has_live=bool(has_live),
-        gpu_clock=int(kv_cache.get("gpu_clock", 0) or 0),
-    )
-    if not isinstance(plan_result, dict):
-        return None
-    overlap_plan = _build_overlap_slot_plan(
-        plan_result=plan_result,
-        frame_indices_cpu=frame_indices_cpu,
-    )
-    if overlap_plan is None:
-        return None
-
-    slot_plan_cpu = overlap_plan.slot_plan_cpu
-    if (
-        not isinstance(slot_plan_cpu, torch.Tensor)
-        or slot_plan_cpu.shape != frame_indices_cpu.shape
-        or slot_plan_cpu.dtype != torch.long
-    ):
-        return None
-    if bool(slot_plan_cpu.lt(-2).any().item()):
-        return None
-
-    # Copy only misses, using fused/batched onload when available.
-    copy_done: torch.cuda.Event | None = None
-    if int(overlap_plan.fill_count) > 0:
-        copy_stream = _shared_cuda_stream(device=device, name="scheme_a_gpu_onload")
-        if copy_stream is None:
-            return None
-        copied = _kv_cache_copy_frame_tensor_plan_from_cpu_to_slots(
-            kv_cache,
-            frame_indices_cpu=frame_indices_cpu,
-            slot_plan_cpu=slot_plan_cpu,
-            copy_plan_cpu=overlap_plan.copy_plan_cpu,
-            expected_copies=int(overlap_plan.fill_count),
-            frame_seqlen=int(frame_seqlen),
-            stream=copy_stream,
-        )
-        if not copied:
-            return None
-        with torch.cuda.device(device):
-            with torch.cuda.stream(copy_stream):
-                copy_done = torch.cuda.Event()
-                copy_done.record(copy_stream)
-        torch.cuda.current_stream(device).wait_event(copy_done)
-
-    next_clock = int(
-        plan_result.get("gpu_clock", int(kv_cache.get("gpu_clock", 0) or 0))
-    )
-    committed = _kv_cache_commit_incremental_tensor_slot_plan_state(
-        kv_cache,
-        plan_result,
-        next_clock,
-        frame_seqlen=int(frame_seqlen),
-        total_tokens=total_tokens,
-    )
-    if not committed:
-        committed = _kv_cache_commit_tensor_slot_plan_state(
-            kv_cache,
-            plan_result,
-            next_clock,
-        )
-    if not committed:
-        return None
-
-    # Gather raw slot/live KV with the native backend or tensor fallback.
-    slot_indices_device = slot_plan_cpu.to(device=device, dtype=torch.long)
-    return _materialize_selected_kv_frames_from_resident_slots(
-        kv_cache,
-        frame_indices_device=frame_indices_device,
-        slot_indices_device=slot_indices_device,
-        frame_seqlen=int(frame_seqlen),
-        total_tokens=total_tokens,
-        live_k=live_k,
-        live_v=live_v,
-        live_start_index=live_start_index,
-    )
 
 
 def _overlay_live_frame_stats(
@@ -2649,57 +1519,6 @@ def _overlay_live_frame_stats(
     return out
 
 
-def _dense_attention_all_frames(
-    kv_cache: dict[str, Any],
-    roped_query: torch.Tensor,
-    *,
-    Lk: int,
-    n_frames: int,
-    frame_seqlen: int,
-    live_k: torch.Tensor | None = None,
-    live_v: torch.Tensor | None = None,
-    live_start_index: int | None = None,
-    out_dtype: torch.dtype,
-    kv_sparse_config: KVSparseConfig | None = None,
-) -> torch.Tensor:
-    _kv_cache_wait_pending_slot_metadata_commit(kv_cache)
-    B, Lq, H, D = roped_query.shape
-    device = roped_query.device
-    if _overlap_attn_enabled_by_env() and int(n_frames) > 0:
-        frame_indices = (
-            torch.arange(int(n_frames), device=device, dtype=torch.long)
-            .view(1, -1)
-            .expand(H, -1)
-            .contiguous()
-        )
-        q_attn = roped_query.permute(0, 2, 1, 3).reshape(B * H, Lq, 1, D)
-        overlap_result = _overlapped_attention_from_gpu_slots_if_possible(
-            kv_cache,
-            q_attn,
-            frame_indices,
-            frame_seqlen,
-            live_k=live_k,
-            live_v=live_v,
-            live_start_index=live_start_index,
-            out_dtype=out_dtype,
-            slot_metadata_ready=True,
-            kv_sparse_config=kv_sparse_config,
-        )
-        if overlap_result is not None:
-            flush_deferred_clean_kv_offloads(kv_cache)
-            return overlap_result.reshape(B, H, Lq, D).permute(0, 2, 1, 3)
-
-    k_full, v_full = _materialize_full_kv_from_cpu_cache(
-        kv_cache,
-        Lk,
-        device,
-        live_k=live_k,
-        live_v=live_v,
-        live_start_index=live_start_index,
-    )
-    flush_deferred_clean_kv_offloads(kv_cache)
-    return attention(roped_query, k_full, v_full).to(out_dtype)
-
 @dataclass(slots=True)
 class _OverlapRowPlan:
     active_rows_cpu: torch.Tensor
@@ -2708,7 +1527,6 @@ class _OverlapRowPlan:
     k_lens_cpu: torch.Tensor
     item_count: int
     cu_seqlens_cpu: torch.Tensor | None = None
-    # Both split parts use ordinals in the complete selected window.
     frame_positions_cpu: torch.Tensor | None = None
     all_full_length: bool = False
     covers_all_heads: bool | None = None
@@ -2729,299 +1547,56 @@ class _OverlapSlotPlan:
 
 
 def _row_plan_from_cpp_dict(raw: Any) -> _OverlapRowPlan | None:
-    if not isinstance(raw, dict):
+    if raw is None:
         return None
-    active_rows_cpu = raw.get("active_rows", None)
-    frame_plan_cpu = raw.get("frame_plan", None)
-    slot_plan_cpu = raw.get("slot_plan", None)
-    k_lens_cpu = raw.get("k_lens", None)
-    if not (
-        isinstance(active_rows_cpu, torch.Tensor)
-        and isinstance(frame_plan_cpu, torch.Tensor)
-        and isinstance(slot_plan_cpu, torch.Tensor)
-        and isinstance(k_lens_cpu, torch.Tensor)
-    ):
-        return None
-    if (
-        active_rows_cpu.device.type != "cpu"
-        or frame_plan_cpu.device.type != "cpu"
-        or slot_plan_cpu.device.type != "cpu"
-        or k_lens_cpu.device.type != "cpu"
-        or active_rows_cpu.dtype != torch.long
-        or frame_plan_cpu.dtype != torch.long
-        or slot_plan_cpu.dtype != torch.long
-        or k_lens_cpu.dtype != torch.int32
-        or active_rows_cpu.ndim != 1
-        or frame_plan_cpu.ndim != 2
-        or tuple(slot_plan_cpu.shape) != tuple(frame_plan_cpu.shape)
-        or int(k_lens_cpu.numel()) != int(active_rows_cpu.numel())
-        or int(frame_plan_cpu.shape[0]) != int(active_rows_cpu.numel())
-    ):
-        return None
-    try:
-        item_count = int(raw.get("item_count", 0) or 0)
-    except Exception:
-        return None
-    cu_seqlens_cpu = raw.get("cu_seqlens", None)
-    if not (
-        isinstance(cu_seqlens_cpu, torch.Tensor)
-        and cu_seqlens_cpu.device.type == "cpu"
-        and cu_seqlens_cpu.dtype == torch.int32
-        and cu_seqlens_cpu.ndim == 1
-    ):
-        cu_seqlens_cpu = None
-    control_long_cpu = raw.get("control_long", None)
-    if not (
-        isinstance(control_long_cpu, torch.Tensor)
-        and control_long_cpu.device.type == "cpu"
-        and control_long_cpu.dtype == torch.long
-        and control_long_cpu.ndim == 1
-    ):
-        control_long_cpu = None
-    control_int_cpu = raw.get("control_int", None)
-    if not (
-        isinstance(control_int_cpu, torch.Tensor)
-        and control_int_cpu.device.type == "cpu"
-        and control_int_cpu.dtype == torch.int32
-        and control_int_cpu.ndim == 1
-    ):
-        control_int_cpu = None
-    active_count = int(active_rows_cpu.numel())
-    plan_items = int(frame_plan_cpu.numel())
-    if (
-        control_long_cpu is not None
-        and control_int_cpu is not None
-        and int(control_long_cpu.numel()) == active_count + 3 * plan_items
-        and int(control_int_cpu.numel()) == 2 * active_count + 1
-        and isinstance(raw.get("frame_positions"), torch.Tensor)
-    ):
-        control_long_cpu = _pin_cpu_tensor_if_available(control_long_cpu.contiguous())
-        control_int_cpu = _pin_cpu_tensor_if_available(control_int_cpu.contiguous())
-        shape = tuple(frame_plan_cpu.shape)
-        return _OverlapRowPlan(
-            active_rows_cpu=control_long_cpu[:active_count],
-            frame_plan_cpu=control_long_cpu.narrow(0, active_count, plan_items).view(shape),
-            slot_plan_cpu=control_long_cpu.narrow(0, active_count + plan_items, plan_items).view(shape),
-            frame_positions_cpu=control_long_cpu.narrow(0, active_count + 2 * plan_items, plan_items).view(shape),
-            k_lens_cpu=control_int_cpu[:active_count],
-            cu_seqlens_cpu=control_int_cpu[active_count:],
-            item_count=item_count,
-            all_full_length=bool(raw.get("all_full_length", False)),
-            covers_all_heads=raw.get("covers_all_heads"),
-            control_long_cpu=control_long_cpu,
-            control_int_cpu=control_int_cpu,
-        )
-    # Pin planner metadata before asynchronous uploads on the control streams.
-    active_rows_cpu = _pin_cpu_tensor_if_available(active_rows_cpu.contiguous())
-    frame_plan_cpu = _pin_cpu_tensor_if_available(frame_plan_cpu.contiguous())
-    slot_plan_cpu = _pin_cpu_tensor_if_available(slot_plan_cpu.contiguous())
-    k_lens_cpu = _pin_cpu_tensor_if_available(k_lens_cpu.contiguous())
-    cu_seqlens_cpu = (
-        _pin_cpu_tensor_if_available(cu_seqlens_cpu.contiguous())
-        if cu_seqlens_cpu is not None
-        else None
-    )
-    control_long_cpu = (
-        _pin_cpu_tensor_if_available(control_long_cpu.contiguous())
-        if control_long_cpu is not None
-        else None
-    )
-    control_int_cpu = (
-        _pin_cpu_tensor_if_available(control_int_cpu.contiguous())
-        if control_int_cpu is not None
-        else None
-    )
+    active_count = raw["active_rows"].numel()
+    shape = raw["frame_plan"].shape
+    plan_items = raw["frame_plan"].numel()
+    control_long = _pin_cpu_tensor_if_available(raw["control_long"])
+    control_int = _pin_cpu_tensor_if_available(raw["control_int"])
     return _OverlapRowPlan(
-        active_rows_cpu=active_rows_cpu,
-        frame_plan_cpu=frame_plan_cpu,
-        slot_plan_cpu=slot_plan_cpu,
-        k_lens_cpu=k_lens_cpu,
-        item_count=item_count,
-        cu_seqlens_cpu=cu_seqlens_cpu,
-        all_full_length=bool(raw.get("all_full_length", False)),
-        covers_all_heads=(
-            bool(raw["covers_all_heads"])
-            if "covers_all_heads" in raw
-            else None
+        active_rows_cpu=control_long[:active_count],
+        frame_plan_cpu=control_long.narrow(0, active_count, plan_items).view(shape),
+        slot_plan_cpu=control_long.narrow(0, active_count + plan_items, plan_items).view(shape),
+        frame_positions_cpu=control_long.narrow(0, active_count + 2 * plan_items, plan_items).view(
+            shape
         ),
-        control_long_cpu=control_long_cpu,
-        control_int_cpu=control_int_cpu,
+        k_lens_cpu=control_int[:active_count],
+        cu_seqlens_cpu=control_int[active_count:],
+        item_count=raw["item_count"],
+        all_full_length=raw["all_full_length"],
+        covers_all_heads=raw["covers_all_heads"],
+        control_long_cpu=control_long,
+        control_int_cpu=control_int,
     )
 
 
-def _frame_positions_for_overlap_row_plan(
-    row_plan: _OverlapRowPlan | None,
-    frame_indices_cpu: torch.Tensor,
-) -> torch.Tensor | None:
-    """Map hit/miss frame IDs to their ordinals in the complete selected window."""
-    if row_plan is None:
-        return None
-    if not (
-        isinstance(frame_indices_cpu, torch.Tensor)
-        and frame_indices_cpu.device.type == "cpu"
-        and frame_indices_cpu.dtype == torch.long
-        and frame_indices_cpu.ndim == 2
-        and isinstance(row_plan.active_rows_cpu, torch.Tensor)
-        and isinstance(row_plan.frame_plan_cpu, torch.Tensor)
-        and row_plan.active_rows_cpu.device.type == "cpu"
-        and row_plan.frame_plan_cpu.device.type == "cpu"
-        and row_plan.active_rows_cpu.dtype == torch.long
-        and row_plan.frame_plan_cpu.dtype == torch.long
-        and row_plan.frame_plan_cpu.ndim == 2
-    ):
-        return None
-    active = row_plan.active_rows_cpu
-    if int(active.numel()) <= 0:
-        return torch.empty_like(row_plan.frame_plan_cpu)
-    if bool((active < 0).any().item()) or bool(
-        (active >= int(frame_indices_cpu.shape[0])).any().item()
-    ):
-        return None
-    selected = frame_indices_cpu.index_select(0, active).contiguous()
-    frame_plan = row_plan.frame_plan_cpu.contiguous()
-    if int(selected.shape[0]) != int(frame_plan.shape[0]):
-        return None
-    matches = frame_plan.unsqueeze(-1).eq(selected.unsqueeze(1))
-    positions = matches.to(dtype=torch.int64).argmax(dim=-1)
-    positions = torch.where(
-        matches.any(dim=-1),
-        positions,
-        torch.full_like(positions, -1),
-    ).contiguous()
-    return _pin_cpu_tensor_if_available(positions)
-
-
-def _overlap_row_plan_covers_all_heads(
-    row_plan: _OverlapRowPlan,
-    num_heads: int,
-) -> bool:
-    num_heads = int(num_heads)
-    active_rows_cpu = row_plan.active_rows_cpu
-    if (
-        num_heads <= 0
-        or not isinstance(active_rows_cpu, torch.Tensor)
-        or active_rows_cpu.device.type != "cpu"
-        or active_rows_cpu.dtype != torch.long
-        or active_rows_cpu.ndim != 1
-        or int(active_rows_cpu.numel()) != num_heads
-    ):
-        return False
-    if row_plan.covers_all_heads is not None:
-        return bool(row_plan.covers_all_heads)
-    return all(int(row) == idx for idx, row in enumerate(active_rows_cpu.tolist()))
+def _overlap_row_plan_covers_all_heads(row_plan: _OverlapRowPlan, num_heads: int) -> bool:
+    return row_plan.covers_all_heads
 
 
 def _overlap_row_plan_covers_full_query_rows(
-    row_plan: _OverlapRowPlan,
-    *,
-    query_rows: int,
-    B: int,
-    num_heads: int,
+    row_plan: _OverlapRowPlan, *, query_rows: int, B: int, num_heads: int
 ) -> bool:
-    return (
-        int(query_rows) == int(B) * int(num_heads)
-        and _overlap_row_plan_covers_all_heads(row_plan, int(num_heads))
+    return int(query_rows) == int(B) * int(num_heads) and _overlap_row_plan_covers_all_heads(
+        row_plan, int(num_heads)
     )
 
 
 def _build_overlap_slot_plan(
-    *,
-    plan_result: dict[str, Any],
-    frame_indices_cpu: torch.Tensor,
+    *, plan_result: dict[str, Any], frame_indices_cpu: torch.Tensor
 ) -> _OverlapSlotPlan | None:
-    slot_plan_cpu = plan_result.get("slot_plan", None)
-    if (
-        not isinstance(slot_plan_cpu, torch.Tensor)
-        or slot_plan_cpu.device.type != "cpu"
-        or slot_plan_cpu.dtype != torch.long
-        or tuple(slot_plan_cpu.shape) != tuple(frame_indices_cpu.shape)
-    ):
-        return None
-    # Planner arrays are uploaded by the asynchronous CUDA extensions.  Keep
-    # them pinned so ``non_blocking=True`` remains a true DMA submission.
-    slot_plan_cpu = _pin_cpu_tensor_if_available(slot_plan_cpu.contiguous())
-    frame_indices_cpu = _pin_cpu_tensor_if_available(frame_indices_cpu.contiguous())
-
-    fill_plan_cpu = plan_result.get("fill_plan", None)
-    if (
-        isinstance(fill_plan_cpu, torch.Tensor)
-        and fill_plan_cpu.device.type == "cpu"
-        and fill_plan_cpu.dtype == torch.long
-        and tuple(fill_plan_cpu.shape) == tuple(slot_plan_cpu.shape)
-    ):
-        fill_plan_cpu = _pin_cpu_tensor_if_available(fill_plan_cpu.contiguous())
-    else:
-        return None
-
-    copy_plan_cpu = plan_result.get("copy_plan", None)
-    if (
-        isinstance(copy_plan_cpu, torch.Tensor)
-        and copy_plan_cpu.device.type == "cpu"
-        and copy_plan_cpu.dtype == torch.long
-        and tuple(copy_plan_cpu.shape) == tuple(slot_plan_cpu.shape)
-    ):
-        copy_plan_cpu = _pin_cpu_tensor_if_available(copy_plan_cpu.contiguous())
-    else:
-        copy_plan_cpu = fill_plan_cpu
-
-    hit_row_plan = _row_plan_from_cpp_dict(plan_result.get("hit_row_plan", None))
-    miss_row_plan = _row_plan_from_cpp_dict(plan_result.get("miss_row_plan", None))
-    try:
-        readable_item_count = int(plan_result.get("readable_item_count", -1))
-        miss_item_count = int(plan_result.get("miss_item_count", -1))
-        copy_item_count = int(plan_result.get("copy_item_count", -1))
-    except Exception:
-        readable_item_count = -1
-        miss_item_count = -1
-        copy_item_count = -1
-
-    valid_cpp_counts = (
-        readable_item_count >= 0
-        and miss_item_count >= 0
-        and copy_item_count >= 0
-    )
-    if not valid_cpp_counts:
-        fill_mask_cpu = fill_plan_cpu.ne(0)
-        readable_mask_cpu = frame_indices_cpu.ge(0) & ((slot_plan_cpu == -2) | slot_plan_cpu.ge(0))
-        miss_mask_cpu = readable_mask_cpu & fill_mask_cpu & slot_plan_cpu.ge(0)
-        readable_item_count = int(readable_mask_cpu.sum().item())
-        miss_item_count = int(miss_mask_cpu.sum().item())
-        copy_item_count = int(copy_plan_cpu.ne(0).sum().item())
-        hit_row_plan = None
-        miss_row_plan = None
-    elif hit_row_plan is not None or miss_row_plan is not None:
-        if not (
-            hit_row_plan is not None
-            and miss_row_plan is not None
-            and int(hit_row_plan.item_count) + int(miss_row_plan.item_count)
-            == readable_item_count
-            and int(miss_row_plan.item_count) == miss_item_count
-        ):
-            hit_row_plan = None
-            miss_row_plan = None
-
-    # Compatibility with extensions predating planner-emitted LF ordinals.
-    if hit_row_plan is not None and hit_row_plan.frame_positions_cpu is None:
-        hit_row_plan.frame_positions_cpu = _frame_positions_for_overlap_row_plan(
-            hit_row_plan,
-            frame_indices_cpu,
-        )
-    if miss_row_plan is not None and miss_row_plan.frame_positions_cpu is None:
-        miss_row_plan.frame_positions_cpu = _frame_positions_for_overlap_row_plan(
-            miss_row_plan,
-            frame_indices_cpu,
-        )
-
     return _OverlapSlotPlan(
-        slot_plan_cpu=slot_plan_cpu,
-        fill_plan_cpu=fill_plan_cpu,
-        copy_plan_cpu=copy_plan_cpu,
-        hit_item_count=readable_item_count - miss_item_count,
-        miss_item_count=miss_item_count,
-        fill_count=copy_item_count,
-        hit_row_plan=hit_row_plan,
-        miss_row_plan=miss_row_plan,
+        slot_plan_cpu=_pin_cpu_tensor_if_available(plan_result["slot_plan"]),
+        fill_plan_cpu=_pin_cpu_tensor_if_available(plan_result["fill_plan"]),
+        copy_plan_cpu=_pin_cpu_tensor_if_available(plan_result["copy_plan"]),
+        hit_item_count=plan_result["readable_item_count"] - plan_result["miss_item_count"],
+        miss_item_count=plan_result["miss_item_count"],
+        fill_count=plan_result["copy_item_count"],
+        hit_row_plan=_row_plan_from_cpp_dict(plan_result["hit_row_plan"]),
+        miss_row_plan=_row_plan_from_cpp_dict(plan_result["miss_row_plan"]),
     )
+
 
 def _apply_fast_lf_rope_to_compact_k(
     k_compact: torch.Tensor,
@@ -3034,7 +1609,6 @@ def _apply_fast_lf_rope_to_compact_k(
     rope_freqs: torch.Tensor | None,
     start_frame: int = 0,
 ) -> torch.Tensor | None:
-    """Apply compacted RoPE after materialization, anchored immediately before global Q."""
     if not (
         isinstance(k_compact, torch.Tensor)
         and k_compact.ndim == 4
@@ -3046,7 +1620,7 @@ def _apply_fast_lf_rope_to_compact_k(
     num_heads = int(num_heads)
     frame_seqlen = int(frame_seqlen)
     selected_frames = int(selected_frames)
-    if batch_size <= 0 or num_heads <= 0 or frame_seqlen <= 0 or selected_frames <= 0:
+    if batch_size <= 0 or num_heads <= 0 or frame_seqlen <= 0 or (selected_frames <= 0):
         return None
     rows, token_count, one, head_dim = (int(v) for v in k_compact.shape)
     expected_rows = batch_size * num_heads
@@ -3068,16 +1642,9 @@ def _apply_fast_lf_rope_to_compact_k(
         return compact_rope
     grid_sizes_kv = rope_grid_sizes.detach().clone()
     grid_sizes_kv[:, 0] = selected_frames
-    # Materializer rows are [B*H, T, 1, D].  LightForcing's RoPE kernel uses
-    # the native [B, T, H, D] layout, so only views/permutes are needed here.
     k_blhd = k_compact.reshape(batch_size, num_heads, token_count, head_dim)
     k_blhd = k_blhd.permute(0, 2, 1, 3).contiguous()
-    k_blhd = compacted_rope_apply(
-        k_blhd,
-        grid_sizes_kv,
-        rope_freqs,
-        start_frame=int(start_frame),
-    )
+    k_blhd = compacted_rope_apply(k_blhd, grid_sizes_kv, rope_freqs, start_frame=int(start_frame))
     return k_blhd.permute(0, 2, 1, 3).reshape(rows, token_count, 1, head_dim).contiguous()
 
 
@@ -3095,7 +1662,6 @@ def _apply_fast_lf_rope_to_row_materialized_k(
     frame_positions_device: torch.Tensor | None = None,
     start_frame: int = 0,
 ) -> torch.Tensor | None:
-    """Apply RoPE using full-window ordinals; hit/miss subset order is not a temporal coordinate."""
     if not (
         isinstance(k_compact, torch.Tensor)
         and isinstance(row_plan, _OverlapRowPlan)
@@ -3111,7 +1677,6 @@ def _apply_fast_lf_rope_to_row_materialized_k(
     batch_size = int(batch_size)
     if active_count <= 0 or batch_size <= 0:
         return None
-
     frame_positions = frame_positions_device
     if frame_positions is None:
         frame_positions_cpu = row_plan.frame_positions_cpu
@@ -3121,32 +1686,22 @@ def _apply_fast_lf_rope_to_row_materialized_k(
             frame_positions_cpu = frame_positions_cpu.repeat(batch_size, 1)
         frame_positions_cpu = _pin_cpu_tensor_if_available(frame_positions_cpu.contiguous())
         frame_positions = frame_positions_cpu.to(
-            device=k_compact.device,
-            dtype=torch.long,
-            non_blocking=True,
+            device=k_compact.device, dtype=torch.long, non_blocking=True
         ).contiguous()
     row_lens = k_lens.to(device=k_compact.device, dtype=torch.int32, non_blocking=True).contiguous()
     if k_compact.ndim == 3:
         if not (
             isinstance(cu_seqlens, torch.Tensor)
             and cu_seqlens.ndim == 1
-            and int(cu_seqlens.numel()) == int(row_lens.numel()) + 1
+            and (int(cu_seqlens.numel()) == int(row_lens.numel()) + 1)
         ):
             return None
         cu_device = cu_seqlens.to(
-            device=k_compact.device,
-            dtype=torch.int32,
-            non_blocking=True,
+            device=k_compact.device, dtype=torch.int32, non_blocking=True
         ).contiguous()
     else:
-        # Padded materialization does not consume cu_seqlens; the auxiliary
-        # controls may still carry one from the planner.
         cu_device = None
-    expected_rows = (
-        int(k_compact.shape[0])
-        if k_compact.ndim == 4
-        else int(row_lens.numel())
-    )
+    expected_rows = int(k_compact.shape[0]) if k_compact.ndim == 4 else int(row_lens.numel())
     if int(frame_positions.shape[0]) != expected_rows or int(row_lens.numel()) != expected_rows:
         return None
     return compacted_rope_apply_packed_rows(
@@ -3192,13 +1747,10 @@ def _run_materialized_slot_plan_flash_attention(
     sink_tokens: int = 0,
     lf_k_start_frame: int = 0,
 ) -> torch.Tensor | None:
-    if fused_kv_frame_materialize is None:
-        return None
     if bool(kv_cache.get("fused_onload_disabled", False)):
         return None
     if int(D) <= 0 or int(D) > 256:
         return None
-
     device = gpu_k.device
     rows = int(q_group.shape[0])
     Lq = int(q_group.shape[1])
@@ -3206,32 +1758,31 @@ def _run_materialized_slot_plan_flash_attention(
     if (
         isinstance(frame_indices_cpu, torch.Tensor)
         and isinstance(slot_plan_cpu, torch.Tensor)
-        and frame_indices_cpu.device.type == "cpu"
-        and slot_plan_cpu.device.type == "cpu"
-        and frame_indices_cpu.dtype == torch.long
-        and slot_plan_cpu.dtype == torch.long
-        and frame_indices_cpu.ndim == 2
-        and tuple(slot_plan_cpu.shape) == tuple(frame_indices_cpu.shape)
+        and (frame_indices_cpu.device.type == "cpu")
+        and (slot_plan_cpu.device.type == "cpu")
+        and (frame_indices_cpu.dtype == torch.long)
+        and (slot_plan_cpu.dtype == torch.long)
+        and (frame_indices_cpu.ndim == 2)
+        and (tuple(slot_plan_cpu.shape) == tuple(frame_indices_cpu.shape))
     ):
-        plan_shape = tuple(int(v) for v in frame_indices_cpu.shape)
+        plan_shape = tuple((int(v) for v in frame_indices_cpu.shape))
     elif (
         isinstance(frame_indices_device, torch.Tensor)
         and isinstance(slot_indices_device, torch.Tensor)
-        and frame_indices_device.device == device
-        and slot_indices_device.device == device
-        and frame_indices_device.dtype == torch.long
-        and slot_indices_device.dtype == torch.long
-        and frame_indices_device.ndim == 2
-        and tuple(slot_indices_device.shape) == tuple(frame_indices_device.shape)
+        and (frame_indices_device.device == device)
+        and (slot_indices_device.device == device)
+        and (frame_indices_device.dtype == torch.long)
+        and (slot_indices_device.dtype == torch.long)
+        and (frame_indices_device.ndim == 2)
+        and (tuple(slot_indices_device.shape) == tuple(frame_indices_device.shape))
     ):
-        plan_shape = tuple(int(v) for v in frame_indices_device.shape)
+        plan_shape = tuple((int(v) for v in frame_indices_device.shape))
     if plan_shape is None:
         return None
     n_selected = int(plan_shape[1])
     token_count = int(n_selected) * int(frame_seqlen)
     if rows != int(B) * int(num_heads) or Lq <= 0 or token_count <= 0:
         return None
-
     has_live = live_k is not None or live_v is not None or live_start_index is not None
     if has_live:
         if live_k is None or live_v is None or live_start_index is None:
@@ -3242,134 +1793,106 @@ def _run_materialized_slot_plan_flash_attention(
             return None
         if not (live_k.is_contiguous() and live_v.is_contiguous()):
             return None
-
     try:
         q_contig = q_group.contiguous()
         head_indices_device = _all_head_indices_device(num_heads, device).contiguous()
-        with _nvtx_range(kv_cache, "horizonkv.overlap_flash_control_h2d"):
-            if (
-                not isinstance(frame_indices_device, torch.Tensor)
-                or frame_indices_device.device != device
-                or frame_indices_device.dtype != torch.long
-                or tuple(frame_indices_device.shape) != plan_shape
-            ):
-                if frame_indices_cpu is None:
-                    return None
-                frame_indices_device = frame_indices_cpu.to(
-                    device=device,
-                    dtype=torch.long,
-                    non_blocking=True,
-                ).contiguous()
-            else:
-                frame_indices_device = frame_indices_device.contiguous()
-            if (
-                not isinstance(slot_indices_device, torch.Tensor)
-                or slot_indices_device.device != device
-                or slot_indices_device.dtype != torch.long
-                or tuple(slot_indices_device.shape) != plan_shape
-            ):
-                if slot_plan_cpu is None:
-                    return None
-                slot_indices_device = slot_plan_cpu.to(
-                    device=device,
-                    dtype=torch.long,
-                    non_blocking=True,
-                ).contiguous()
-            else:
-                slot_indices_device = slot_indices_device.contiguous()
-
+        if (
+            not isinstance(frame_indices_device, torch.Tensor)
+            or frame_indices_device.device != device
+            or frame_indices_device.dtype != torch.long
+            or (tuple(frame_indices_device.shape) != plan_shape)
+        ):
+            if frame_indices_cpu is None:
+                return None
+            frame_indices_device = frame_indices_cpu.to(
+                device=device, dtype=torch.long, non_blocking=True
+            ).contiguous()
+        else:
+            frame_indices_device = frame_indices_device.contiguous()
+        if (
+            not isinstance(slot_indices_device, torch.Tensor)
+            or slot_indices_device.device != device
+            or slot_indices_device.dtype != torch.long
+            or (tuple(slot_indices_device.shape) != plan_shape)
+        ):
+            if slot_plan_cpu is None:
+                return None
+            slot_indices_device = slot_plan_cpu.to(
+                device=device, dtype=torch.long, non_blocking=True
+            ).contiguous()
+        else:
+            slot_indices_device = slot_indices_device.contiguous()
         k_compact = torch.empty((rows, token_count, 1, D), device=device, dtype=gpu_k.dtype)
         v_compact = torch.empty((rows, token_count, 1, D), device=device, dtype=gpu_v.dtype)
-        with _nvtx_range(kv_cache, "horizonkv.overlap_materialize_slots"):
-            ok = fused_kv_frame_materialize(
-                gpu_k=gpu_k,
-                gpu_v=gpu_v,
-                k_out=k_compact,
-                v_out=v_compact,
-                head_indices=head_indices_device,
-                frame_indices=frame_indices_device,
-                slot_indices=slot_indices_device,
-                frame_seqlen=frame_seqlen,
-                total_tokens=total_tokens,
-                num_heads=num_heads,
-                gpu_cache_frames=gpu_cache_frames,
-                live_k=live_k if has_live else None,
-                live_v=live_v if has_live else None,
-                live_start_index=int(live_start_index or 0),
-            )
+        ok = fused_kv_frame_materialize(
+            gpu_k=gpu_k,
+            gpu_v=gpu_v,
+            k_out=k_compact,
+            v_out=v_compact,
+            head_indices=head_indices_device,
+            frame_indices=frame_indices_device,
+            slot_indices=slot_indices_device,
+            frame_seqlen=frame_seqlen,
+            total_tokens=total_tokens,
+            num_heads=num_heads,
+            gpu_cache_frames=gpu_cache_frames,
+            live_k=live_k if has_live else None,
+            live_v=live_v if has_live else None,
+            live_start_index=int(live_start_index or 0),
+        )
         if not ok:
             return None
-        if fast_lf_rope:
-            k_compact = _apply_fast_lf_rope_to_compact_k(
-                k_compact,
-                batch_size=B,
-                num_heads=num_heads,
-                frame_seqlen=frame_seqlen,
-                selected_frames=n_selected,
-                rope_grid_sizes=rope_grid_sizes,
-                rope_freqs=rope_freqs,
-                start_frame=int(lf_k_start_frame),
-            )
-            if k_compact is None:
-                return None
-        with _nvtx_range(kv_cache, "horizonkv.overlap_flash_attn"):
-            flush_deferred_clean_kv_offloads(kv_cache)
-            block_sparsity = _overlap_effective_block_sparsity(
-                kv_sparse_config,
-                n_selected,
-            )
-            if (
-                block_sparsity > 0.0
-                and blocksparse_attention_pooled_triton is not None
-                and not bool(kv_cache.get("overlap_blocksparse_disabled", False))
-            ):
-                try:
-                    with _nvtx_range(kv_cache, "horizonkv.overlap_blocksparse_attn"):
-                        sparse_out = blocksparse_attention_pooled_triton(
-                            q=q_contig,
-                            k=k_compact,
-                            v=v_compact,
-                            sparsity=block_sparsity,
-                            block_m=_overlap_blocksparse_block_size(
-                                kv_sparse_config,
-                                "attn_block_q",
-                            ),
-                            block_n=_overlap_blocksparse_block_size(
-                                kv_sparse_config,
-                                "attn_block_k",
-                            ),
-                            force_sparse=True,
-                        )
-                    if isinstance(sparse_out, torch.Tensor):
-                        return sparse_out.to(out_dtype or q_group.dtype)
-                except Exception as exc:
-                    raise SparseAttentionError(
-                        "materialized sparse attention failed; refusing dense fallback"
-                    ) from exc
-            if block_sparsity > 0.0:
-                raise SparseAttentionError(
-                    "materialized sparse attention unavailable "
-                    f"(sparsity={block_sparsity}, selected_frames={n_selected}, "
-                    f"tokens={token_count}); refusing dense fallback"
+        k_compact = _apply_fast_lf_rope_to_compact_k(
+            k_compact,
+            batch_size=B,
+            num_heads=num_heads,
+            frame_seqlen=frame_seqlen,
+            selected_frames=n_selected,
+            rope_grid_sizes=rope_grid_sizes,
+            rope_freqs=rope_freqs,
+            start_frame=int(lf_k_start_frame),
+        )
+        if k_compact is None:
+            return None
+        flush_deferred_clean_kv_offloads(kv_cache)
+        block_sparsity = _overlap_effective_block_sparsity(kv_sparse_config, n_selected)
+        if block_sparsity > 0.0 and (not bool(kv_cache.get("overlap_blocksparse_disabled", False))):
+            try:
+                sparse_out = blocksparse_attention_pooled_triton(
+                    q=q_contig,
+                    k=k_compact,
+                    v=v_compact,
+                    sparsity=block_sparsity,
+                    block_m=_overlap_blocksparse_block_size(kv_sparse_config, "attn_block_q"),
+                    block_n=_overlap_blocksparse_block_size(kv_sparse_config, "attn_block_k"),
+                    force_sparse=True,
                 )
-            if flash_attn is not None and hasattr(flash_attn, "flash_attn_func"):
-                try:
-                    # The materialized path always has uniform lengths.  Avoid
-                    # attention()'s per-call q/k length and cu-seqlen setup.
-                    out = flash_attn.flash_attn_func(
-                        q_contig,
-                        k_compact,
-                        v_compact,
-                        dropout_p=0.0,
-                        softmax_scale=None,
-                        causal=False,
-                        window_size=(-1, -1),
-                        deterministic=False,
-                    )
-                    return out.to(out_dtype or q_group.dtype)
-                except Exception:
-                    pass
-            return attention(q_contig, k_compact, v_compact).to(out_dtype or q_group.dtype)
+                if isinstance(sparse_out, torch.Tensor):
+                    return sparse_out.to(out_dtype or q_group.dtype)
+            except Exception as exc:
+                raise SparseAttentionError(
+                    "materialized sparse attention failed; refusing dense fallback"
+                ) from exc
+        if block_sparsity > 0.0:
+            raise SparseAttentionError(
+                f"materialized sparse attention unavailable (sparsity={block_sparsity}, selected_frames={n_selected}, tokens={token_count}); refusing dense fallback"
+            )
+        if hasattr(flash_attn, "flash_attn_func"):
+            try:
+                out = flash_attn.flash_attn_func(
+                    q_contig,
+                    k_compact,
+                    v_compact,
+                    dropout_p=0.0,
+                    softmax_scale=None,
+                    causal=False,
+                    window_size=(-1, -1),
+                    deterministic=False,
+                )
+                return out.to(out_dtype or q_group.dtype)
+            except Exception:
+                pass
+        return attention(q_contig, k_compact, v_compact).to(out_dtype or q_group.dtype)
     except SparseAttentionError:
         raise
     except Exception as exc:
@@ -3384,19 +1907,16 @@ def _run_materialized_slot_plan_flash_attention(
 
 
 def _copy_overlap_control_to_device(
-    kv_cache: dict[str, Any],
-    *,
-    workspace_name: str,
-    cpu_tensor: torch.Tensor,
-    device: torch.device,
+    kv_cache: dict[str, Any], *, workspace_name: str, cpu_tensor: torch.Tensor, device: torch.device
 ) -> tuple[torch.Tensor, tuple[Any, ...]]:
-    # Fallback planners and batch expansion may require re-pinning before H2D.
     cpu_tensor = _pin_cpu_tensor_if_available(cpu_tensor.contiguous())
     cache = kv_cache.setdefault("_kv_sparse_overlap_control_workspaces", {})
     if not isinstance(cache, dict):
         cache = {}
         kv_cache["_kv_sparse_overlap_control_workspaces"] = cache
-    device_index = int(device.index) if device.index is not None else int(torch.cuda.current_device())
+    device_index = (
+        int(device.index) if device.index is not None else int(torch.cuda.current_device())
+    )
     key = (str(workspace_name), device_index, cpu_tensor.dtype)
     entry = cache.get(key, None)
     current_stream = torch.cuda.current_stream(device)
@@ -3406,14 +1926,13 @@ def _copy_overlap_control_to_device(
             current_stream.wait_event(last_use_event)
     else:
         entry = {}
-
     required = int(cpu_tensor.numel())
     buffer = entry.get("buffer", None)
     if (
         not isinstance(buffer, torch.Tensor)
         or buffer.device != device
         or buffer.dtype != cpu_tensor.dtype
-        or int(buffer.numel()) < required
+        or (int(buffer.numel()) < required)
     ):
         capacity = 1 << max(0, required - 1).bit_length()
         buffer = torch.empty((capacity,), device=device, dtype=cpu_tensor.dtype)
@@ -3421,20 +1940,16 @@ def _copy_overlap_control_to_device(
         cache[key] = entry
     view = buffer.narrow(0, 0, required)
     view.copy_(cpu_tensor, non_blocking=True)
-    return view, key
+    return (view, key)
 
 
 def _mark_overlap_control_workspaces_used(
-    kv_cache: dict[str, Any],
-    controls: dict[str, Any],
-    stream: torch.cuda.Stream,
+    kv_cache: dict[str, Any], controls: dict[str, Any], stream: torch.cuda.Stream
 ) -> None:
     cache = kv_cache.get("_kv_sparse_overlap_control_workspaces", None)
     keys = controls.get("workspace_keys", ())
-    if not isinstance(cache, dict) or not isinstance(keys, tuple) or not keys:
+    if not isinstance(cache, dict) or not isinstance(keys, tuple) or (not keys):
         return
-    # B>1 may repeat positions into a separate device allocation. Protect
-    # that allocation on every consumer stream as well as the shared buffers.
     for name in ("control_long", "control_int", "frame_positions"):
         tensor = controls.get(name, None)
         if isinstance(tensor, torch.Tensor):
@@ -3459,232 +1974,42 @@ def _prepare_compact_slot_plan_controls(
 ) -> dict[str, Any] | None:
     if row_plan.item_count <= 0:
         return None
-    active_count = int(row_plan.active_rows_cpu.numel())
-    max_selected = int(row_plan.frame_plan_cpu.shape[1])
-    if active_count <= 0 or max_selected <= 0 or int(B) <= 0 or int(num_heads) <= 0:
-        return None
-    if (
-        row_plan.active_rows_cpu.device.type != "cpu"
-        or row_plan.frame_plan_cpu.device.type != "cpu"
-        or row_plan.slot_plan_cpu.device.type != "cpu"
-        or row_plan.k_lens_cpu.device.type != "cpu"
-    ):
-        return None
-    if (
-        row_plan.active_rows_cpu.dtype != torch.long
-        or row_plan.frame_plan_cpu.dtype != torch.long
-        or row_plan.slot_plan_cpu.dtype != torch.long
-        or row_plan.k_lens_cpu.dtype != torch.int32
-    ):
-        return None
-    if tuple(row_plan.slot_plan_cpu.shape) != tuple(row_plan.frame_plan_cpu.shape):
-        return None
-    if int(row_plan.k_lens_cpu.numel()) != active_count:
-        return None
-
-    try:
-        B = int(B)
-        num_heads = int(num_heads)
-        plan_items = active_count * max_selected
-        full_row_count = B * active_count
-        token_count = max_selected * int(frame_seqlen)
-        all_full_length = bool(row_plan.all_full_length)
-        full_q_rows = _overlap_row_plan_covers_all_heads(row_plan, num_heads)
-        control_long_device = None
-        control_int_device = None
-        workspace_keys: list[tuple[Any, ...]] = []
-        full_row_indices = None
-        frame_positions_device = None
-        control_long_cpu = row_plan.control_long_cpu
-        if (
-            isinstance(control_long_cpu, torch.Tensor)
-            and control_long_cpu.device.type == "cpu"
-            and control_long_cpu.dtype == torch.long
-            and control_long_cpu.ndim == 1
-            and int(control_long_cpu.numel()) in (active_count + 2 * plan_items, active_count + 3 * plan_items)
-        ):
-            upload_long_cpu = control_long_cpu
-            if B > 1 and not full_q_rows:
-                batch_offsets_cpu = torch.arange(B, dtype=torch.long).view(B, 1) * num_heads
-                full_row_indices_cpu = (
-                    batch_offsets_cpu
-                    + row_plan.active_rows_cpu.contiguous().view(1, active_count)
-                ).reshape(-1).contiguous()
-                upload_long_cpu = torch.empty(
-                    (int(control_long_cpu.numel()) + full_row_count,),
-                    dtype=torch.long,
-                    device="cpu",
-                )
-                upload_long_cpu = _pin_cpu_tensor_if_available(upload_long_cpu)
-                upload_long_cpu[: int(control_long_cpu.numel())].copy_(control_long_cpu)
-                upload_long_cpu[int(control_long_cpu.numel()) :].copy_(full_row_indices_cpu)
-            control_long_device, workspace_key = _copy_overlap_control_to_device(
-                kv_cache,
-                workspace_name=f"{workspace_name}.long",
-                cpu_tensor=upload_long_cpu,
-                device=device,
-            )
-            workspace_keys.append(workspace_key)
-            active_rows_device = control_long_device.narrow(0, 0, active_count)
-            frame_indices_device = control_long_device.narrow(
-                0,
-                active_count,
-                plan_items,
-            ).view(active_count, max_selected)
-            slot_indices_device = control_long_device.narrow(
-                0,
-                active_count + plan_items,
-                plan_items,
-            ).view(active_count, max_selected)
-            if int(control_long_cpu.numel()) == active_count + 3 * plan_items:
-                frame_positions_device = control_long_device.narrow(
-                    0, active_count + 2 * plan_items, plan_items,
-                ).view(active_count, max_selected)
-                if B > 1:
-                    frame_positions_device = frame_positions_device.repeat(B, 1)
-            if B == 1 and not full_q_rows:
-                full_row_indices = active_rows_device
-            elif B > 1 and not full_q_rows:
-                full_row_indices = control_long_device.narrow(
-                    0,
-                    int(control_long_cpu.numel()),
-                    full_row_count,
-                )
-        else:
-            active_rows_device = row_plan.active_rows_cpu.to(
-                device=device,
-                dtype=torch.long,
-                non_blocking=True,
-            ).contiguous()
-            frame_indices_device = row_plan.frame_plan_cpu.to(
-                device=device,
-                dtype=torch.long,
-                non_blocking=True,
-            ).contiguous()
-            slot_indices_device = row_plan.slot_plan_cpu.to(
-                device=device,
-                dtype=torch.long,
-                non_blocking=True,
-            ).contiguous()
-            if B == 1 and not full_q_rows:
-                full_row_indices = active_rows_device
-            elif B > 1 and not full_q_rows:
-                batch_offsets_cpu = torch.arange(B, dtype=torch.long).view(B, 1) * num_heads
-                full_row_indices_cpu = (
-                    batch_offsets_cpu
-                    + row_plan.active_rows_cpu.contiguous().view(1, active_count)
-                ).reshape(-1).contiguous()
-                full_row_indices = full_row_indices_cpu.to(
-                    device=device,
-                    dtype=torch.long,
-                    non_blocking=True,
-                ).contiguous()
-
-        control_int_cpu = row_plan.control_int_cpu
-        if (
-            all_full_length
-            and full_row_count > 0
-            and token_count > 0
-        ):
-            k_lens_device, cu_seqlens_k = _cached_flash_varlen_uniform_k_controls(
-                kv_cache,
-                device,
-                full_row_count,
-                token_count,
-            )
-        elif (
-            B == 1
-            and isinstance(control_int_cpu, torch.Tensor)
-            and control_int_cpu.device.type == "cpu"
-            and control_int_cpu.dtype == torch.int32
-            and control_int_cpu.ndim == 1
-            and int(control_int_cpu.numel()) == active_count + active_count + 1
-        ):
-            control_int_device, workspace_key = _copy_overlap_control_to_device(
-                kv_cache,
-                workspace_name=f"{workspace_name}.int",
-                cpu_tensor=control_int_cpu,
-                device=device,
-            )
-            workspace_keys.append(workspace_key)
-            k_lens_device = control_int_device.narrow(0, 0, active_count)
-            cu_seqlens_k = control_int_device.narrow(0, active_count, active_count + 1)
-        else:
-            k_lens_one_batch_cpu = row_plan.k_lens_cpu.contiguous()
-            if B == 1:
-                k_lens_cpu = k_lens_one_batch_cpu
-                cu_seqlens_cpu = row_plan.cu_seqlens_cpu
-                if (
-                    isinstance(cu_seqlens_cpu, torch.Tensor)
-                    and cu_seqlens_cpu.device.type == "cpu"
-                    and cu_seqlens_cpu.dtype == torch.int32
-                    and cu_seqlens_cpu.ndim == 1
-                    and int(cu_seqlens_cpu.numel()) == active_count + 1
-                ):
-                    cu_seqlens_cpu = cu_seqlens_cpu.contiguous()
-                else:
-                    cu_seqlens_cpu = torch.cat(
-                        [torch.zeros((1,), dtype=torch.int32), k_lens_cpu],
-                    ).cumsum(0, dtype=torch.int32).contiguous()
-            else:
-                k_lens_cpu = (
-                    k_lens_one_batch_cpu.view(1, active_count)
-                    .expand(B, active_count)
-                    .reshape(-1)
-                    .contiguous()
-                )
-                cu_seqlens_cpu = torch.cat(
-                    [torch.zeros((1,), dtype=torch.int32), k_lens_cpu],
-                ).cumsum(0, dtype=torch.int32).contiguous()
-            upload_int_cpu = torch.empty(
-                (int(k_lens_cpu.numel()) + int(cu_seqlens_cpu.numel()),),
-                dtype=torch.int32,
-                device="cpu",
-            )
-            upload_int_cpu = _pin_cpu_tensor_if_available(upload_int_cpu)
-            upload_int_cpu[: int(k_lens_cpu.numel())].copy_(k_lens_cpu)
-            upload_int_cpu[int(k_lens_cpu.numel()) :].copy_(cu_seqlens_cpu)
-            control_int_device, workspace_key = _copy_overlap_control_to_device(
-                kv_cache,
-                workspace_name=f"{workspace_name}.int",
-                cpu_tensor=upload_int_cpu,
-                device=device,
-            )
-            workspace_keys.append(workspace_key)
-            k_lens_device = control_int_device.narrow(0, 0, int(k_lens_cpu.numel()))
-            cu_seqlens_k = control_int_device.narrow(
-                0,
-                int(k_lens_cpu.numel()),
-                int(cu_seqlens_cpu.numel()),
-            )
-    except Exception as exc:
-        if str(os.getenv("HORIZONKV_FUSED_ONLOAD_VERBOSE", "0")).strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        ):
-            print(f"[horizonkv] compact Flash control upload skipped after failure: {exc}")
-        kv_cache["overlap_flash_lse_disabled"] = True
-        return None
-
-    return {
-        "active_count": active_count,
-        "max_selected": max_selected,
-        "token_count": token_count,
-        "head_indices": active_rows_device,
-        "frame_indices": frame_indices_device,
-        "slot_indices": slot_indices_device,
-        "frame_positions": frame_positions_device,
-        "full_row_indices": full_row_indices,
-        "full_q_rows": full_q_rows,
-        "k_lens": k_lens_device,
-        "cu_seqlens_k": cu_seqlens_k,
-        "all_full_length": all_full_length,
-        "control_long": control_long_device,
-        "control_int": control_int_device,
-        "workspace_keys": tuple(workspace_keys),
-    }
+    active_count = row_plan.active_rows_cpu.numel()
+    max_selected = row_plan.frame_plan_cpu.shape[1]
+    plan_items = active_count * max_selected
+    control_long, long_key = _copy_overlap_control_to_device(
+        kv_cache,
+        workspace_name=f"{workspace_name}.long",
+        cpu_tensor=row_plan.control_long_cpu,
+        device=device,
+    )
+    control_int, int_key = _copy_overlap_control_to_device(
+        kv_cache,
+        workspace_name=f"{workspace_name}.int",
+        cpu_tensor=row_plan.control_int_cpu,
+        device=device,
+    )
+    active_rows = control_long[:active_count]
+    shape = (active_count, max_selected)
+    return dict(
+        active_count=active_count,
+        max_selected=max_selected,
+        token_count=max_selected * frame_seqlen,
+        head_indices=active_rows,
+        frame_indices=control_long.narrow(0, active_count, plan_items).view(shape),
+        slot_indices=control_long.narrow(0, active_count + plan_items, plan_items).view(shape),
+        frame_positions=control_long.narrow(0, active_count + 2 * plan_items, plan_items).view(
+            shape
+        ),
+        full_row_indices=None if row_plan.covers_all_heads else active_rows,
+        full_q_rows=row_plan.covers_all_heads,
+        k_lens=control_int[:active_count],
+        cu_seqlens_k=control_int[active_count:],
+        all_full_length=row_plan.all_full_length,
+        control_long=control_long,
+        control_int=control_int,
+        workspace_keys=(long_key, int_key),
+    )
 
 
 def _materialize_compact_slot_plan(
@@ -3704,16 +2029,10 @@ def _materialize_compact_slot_plan(
     live_start_index: int | None = None,
     controls: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    if fused_kv_frame_materialize is None or row_plan.item_count <= 0:
+    if row_plan.item_count <= 0:
         return None
-
-    active_count = int(row_plan.active_rows_cpu.numel())
-    max_selected = int(row_plan.frame_plan_cpu.shape[1])
-    if active_count <= 0 or max_selected <= 0:
-        return None
-
     device = gpu_k.device
-    if not isinstance(controls, dict):
+    if controls is None:
         controls = _prepare_compact_slot_plan_controls(
             kv_cache,
             device=device,
@@ -3722,143 +2041,47 @@ def _materialize_compact_slot_plan(
             num_heads=num_heads,
             frame_seqlen=frame_seqlen,
         )
-    if not isinstance(controls, dict):
-        return None
-    if (
-        int(controls.get("active_count", -1)) != active_count
-        or int(controls.get("max_selected", -1)) != max_selected
-    ):
-        return None
-
-    ready_event = controls.get("ready_event", None)
-    if ready_event is not None and torch.cuda.is_available():
+    ready_event = controls.get("ready_event")
+    if ready_event is not None:
         torch.cuda.current_stream(device).wait_event(ready_event)
-
-    token_count = int(controls.get("token_count", max_selected * int(frame_seqlen)))
-    if token_count <= 0:
-        return None
-
-    cu_seqlens_k = controls.get("cu_seqlens_k", None)
-    if (
-        fused_kv_frame_materialize_varlen is not None
-        and isinstance(cu_seqlens_k, torch.Tensor)
-        and cu_seqlens_k.device == device
-        and cu_seqlens_k.dtype == torch.int32
-        and cu_seqlens_k.is_contiguous()
-    ):
-        packed_token_count = int(B) * int(row_plan.item_count) * int(frame_seqlen)
-        if packed_token_count <= 0:
-            return None
-        k_compact = torch.empty(
-            (packed_token_count, 1, int(D)),
-            device=device,
-            dtype=gpu_k.dtype,
-        )
-        v_compact = torch.empty_like(k_compact)
-        try:
-            ok = fused_kv_frame_materialize_varlen(
-                gpu_k=gpu_k,
-                gpu_v=gpu_v,
-                k_out=k_compact,
-                v_out=v_compact,
-                head_indices=controls["head_indices"],
-                frame_indices=controls["frame_indices"],
-                slot_indices=controls["slot_indices"],
-                cu_seqlens_k=cu_seqlens_k,
-                frame_seqlen=frame_seqlen,
-                total_tokens=total_tokens,
-                num_heads=num_heads,
-                gpu_cache_frames=gpu_cache_frames,
-                live_k=live_k,
-                live_v=live_v,
-                live_start_index=int(live_start_index or 0),
-            )
-            _mark_overlap_control_workspaces_used(
-                kv_cache,
-                controls,
-                torch.cuda.current_stream(device),
-            )
-        except Exception as exc:
-            ok = False
-            if str(os.getenv("HORIZONKV_FUSED_ONLOAD_VERBOSE", "0")).strip().lower() in (
-                "1",
-                "true",
-                "yes",
-                "on",
-            ):
-                print(f"[horizonkv] varlen Flash materialize fallback after failure: {exc}")
-        if ok:
-            return {
-                "controls": controls,
-                "full_row_indices": controls["full_row_indices"],
-                "full_q_rows": bool(controls.get("full_q_rows", False)),
-                "k_lens": controls["k_lens"],
-                "cu_seqlens_k": cu_seqlens_k,
-                "max_seqlen_k": token_count,
-                "all_full_length": True,
-                "frame_seqlen": int(frame_seqlen),
-                "k_compact": k_compact,
-                "v_compact": v_compact,
-            }
-
     k_compact = torch.empty(
-        (int(B) * active_count, token_count, 1, int(D)),
-        device=device,
-        dtype=gpu_k.dtype,
+        (row_plan.item_count * frame_seqlen, 1, D), device=device, dtype=gpu_k.dtype
     )
     v_compact = torch.empty_like(k_compact)
-    try:
-        ok = fused_kv_frame_materialize(
-            gpu_k=gpu_k,
-            gpu_v=gpu_v,
-            k_out=k_compact,
-            v_out=v_compact,
-            head_indices=controls["head_indices"],
-            frame_indices=controls["frame_indices"],
-            slot_indices=controls["slot_indices"],
-            frame_seqlen=frame_seqlen,
-            total_tokens=total_tokens,
-            num_heads=num_heads,
-            gpu_cache_frames=gpu_cache_frames,
-            live_k=live_k,
-            live_v=live_v,
-            live_start_index=int(live_start_index or 0),
-        )
-        _mark_overlap_control_workspaces_used(
-            kv_cache,
-            controls,
-            torch.cuda.current_stream(device),
-        )
-    except Exception as exc:
-        if str(os.getenv("HORIZONKV_FUSED_ONLOAD_VERBOSE", "0")).strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        ):
-            print(f"[horizonkv] compact Flash materialize fallback after failure: {exc}")
-        kv_cache["overlap_flash_lse_disabled"] = True
-        return None
-    if not ok:
-        kv_cache["overlap_flash_lse_disabled"] = True
-        return None
-
-    return {
-        "full_row_indices": controls["full_row_indices"],
-        "controls": controls,
-        "full_q_rows": bool(controls.get("full_q_rows", False)),
-        "k_lens": controls["k_lens"],
-        "cu_seqlens_k": controls.get("cu_seqlens_k", None),
-        "max_seqlen_k": token_count,
-        "all_full_length": bool(controls.get("all_full_length", False)),
-        "frame_seqlen": int(frame_seqlen),
-        "k_compact": k_compact,
-        "v_compact": v_compact,
-    }
+    fused_kv_frame_materialize_varlen(
+        gpu_k=gpu_k,
+        gpu_v=gpu_v,
+        k_out=k_compact,
+        v_out=v_compact,
+        head_indices=controls["head_indices"],
+        frame_indices=controls["frame_indices"],
+        slot_indices=controls["slot_indices"],
+        cu_seqlens_k=controls["cu_seqlens_k"],
+        frame_seqlen=frame_seqlen,
+        total_tokens=total_tokens,
+        num_heads=num_heads,
+        gpu_cache_frames=gpu_cache_frames,
+        live_k=live_k,
+        live_v=live_v,
+        live_start_index=int(live_start_index or 0),
+    )
+    _mark_overlap_control_workspaces_used(kv_cache, controls, torch.cuda.current_stream(device))
+    return dict(
+        controls=controls,
+        full_row_indices=controls["full_row_indices"],
+        full_q_rows=controls["full_q_rows"],
+        k_lens=controls["k_lens"],
+        cu_seqlens_k=controls["cu_seqlens_k"],
+        max_seqlen_k=controls["token_count"],
+        all_full_length=True,
+        frame_seqlen=frame_seqlen,
+        k_compact=k_compact,
+        v_compact=v_compact,
+    )
 
 
 class SparseAttentionError(RuntimeError):
-    """A requested sparse computation must not silently change to dense."""
+    pass
 
 
 def _run_blocksparse_attention_part_with_lse(
@@ -3875,27 +2098,18 @@ def _run_blocksparse_attention_part_with_lse(
     kv_sparse_config: KVSparseConfig | None,
     selected_frames: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    block_sparsity = _overlap_effective_block_sparsity(
-        kv_sparse_config,
-        selected_frames,
-    )
+    block_sparsity = _overlap_effective_block_sparsity(kv_sparse_config, selected_frames)
     if block_sparsity <= 0.0:
         return None
-    failure = (
-        f"{label_prefix}: sparse attention failed (sparsity={block_sparsity}, "
-        f"q={tuple(q.shape)}, k={tuple(k.shape)}, max_seqlen_k={max_seqlen_k}); "
-        "refusing dense fallback"
-    )
+    failure = f"{label_prefix}: sparse attention failed (sparsity={block_sparsity}, q={tuple(q.shape)}, k={tuple(k.shape)}, max_seqlen_k={max_seqlen_k}); refusing dense fallback"
     if (
-        blocksparse_attention_pooled_triton is None
-        or bool(kv_cache.get("overlap_blocksparse_disabled", False))
+        bool(kv_cache.get("overlap_blocksparse_disabled", False))
         or q.ndim != 4
         or int(q.shape[2]) != 1
-        or k.ndim not in (3, 4)
-        or tuple(k.shape) != tuple(v.shape)
+        or (k.ndim not in (3, 4))
+        or (tuple(k.shape) != tuple(v.shape))
     ):
         raise SparseAttentionError(failure)
-
     rows = int(q.shape[0])
     packed_varlen = False
     if k.ndim == 4:
@@ -3906,65 +2120,53 @@ def _run_blocksparse_attention_part_with_lse(
     else:
         token_count = int(max_seqlen_k or 0)
         if uniform_full_length and (
-            token_count > 0
-            and int(k.shape[0]) == rows * token_count
-            and int(k.shape[1]) == 1
+            token_count > 0 and int(k.shape[0]) == rows * token_count and (int(k.shape[1]) == 1)
         ):
             k_rows = k.view(rows, token_count, int(k.shape[1]), int(k.shape[2]))
             v_rows = v.view(rows, token_count, int(v.shape[1]), int(v.shape[2]))
         elif (
             token_count <= 0
             or int(k.shape[1]) != 1
-            or not isinstance(k_lens, torch.Tensor)
-            or not isinstance(cu_seqlens_k, torch.Tensor)
-            or k_lens.device != q.device
-            or cu_seqlens_k.device != q.device
-            or k_lens.dtype != torch.int32
-            or cu_seqlens_k.dtype != torch.int32
-            or int(k_lens.numel()) != rows
-            or int(cu_seqlens_k.numel()) != rows + 1
+            or (not isinstance(k_lens, torch.Tensor))
+            or (not isinstance(cu_seqlens_k, torch.Tensor))
+            or (k_lens.device != q.device)
+            or (cu_seqlens_k.device != q.device)
+            or (k_lens.dtype != torch.int32)
+            or (cu_seqlens_k.dtype != torch.int32)
+            or (int(k_lens.numel()) != rows)
+            or (int(cu_seqlens_k.numel()) != rows + 1)
         ):
             raise SparseAttentionError(failure)
         else:
             packed_varlen = True
             k_rows = k
             v_rows = v
-
     try:
-        with _nvtx_range(kv_cache, f"horizonkv.{label_prefix}_blocksparse_attn"):
-            sparse_part = blocksparse_attention_pooled_triton(
-                q=q.contiguous(),
-                k=k_rows.contiguous(),
-                v=v_rows.contiguous(),
-                sparsity=block_sparsity,
-                block_m=_overlap_blocksparse_block_size(
-                    kv_sparse_config,
-                    "attn_block_q",
-                ),
-                block_n=_overlap_blocksparse_block_size(
-                    kv_sparse_config,
-                    "attn_block_k",
-                ),
-                return_lse=True,
-                k_lens=k_lens if packed_varlen else None,
-                cu_seqlens_k=cu_seqlens_k if packed_varlen else None,
-                max_seqlen_k=max_seqlen_k if packed_varlen else None,
-                force_sparse=True,
-            )
+        sparse_part = blocksparse_attention_pooled_triton(
+            q=q.contiguous(),
+            k=k_rows.contiguous(),
+            v=v_rows.contiguous(),
+            sparsity=block_sparsity,
+            block_m=_overlap_blocksparse_block_size(kv_sparse_config, "attn_block_q"),
+            block_n=_overlap_blocksparse_block_size(kv_sparse_config, "attn_block_k"),
+            return_lse=True,
+            k_lens=k_lens if packed_varlen else None,
+            cu_seqlens_k=cu_seqlens_k if packed_varlen else None,
+            max_seqlen_k=max_seqlen_k if packed_varlen else None,
+            force_sparse=True,
+        )
     except Exception as exc:
         raise SparseAttentionError(failure) from exc
-
     if not (
         isinstance(sparse_part, tuple)
         and len(sparse_part) == 2
         and isinstance(sparse_part[0], torch.Tensor)
         and isinstance(sparse_part[1], torch.Tensor)
-        and tuple(sparse_part[0].shape) == tuple(q.shape)
-        and tuple(sparse_part[1].shape)
-        == (rows, int(q.shape[2]), int(q.shape[1]))
+        and (tuple(sparse_part[0].shape) == tuple(q.shape))
+        and (tuple(sparse_part[1].shape) == (rows, int(q.shape[2]), int(q.shape[1])))
     ):
         raise SparseAttentionError(failure)
-    return sparse_part[0], sparse_part[1]
+    return (sparse_part[0], sparse_part[1])
 
 
 def _run_compact_slot_plan_flash_attention_part_from_materialized(
@@ -3988,33 +2190,30 @@ def _run_compact_slot_plan_flash_attention_part_from_materialized(
     out_dtype = out_dtype or q_group.dtype
     Lq = int(q_group.shape[1])
     q_heads = int(q_group.shape[2])
-
-    full_q_rows = (
-        bool(materialized_part.get("full_q_rows", False))
-        and _overlap_row_plan_covers_full_query_rows(
-            row_plan,
-            query_rows=int(q_group.shape[0]),
-            B=int(B),
-            num_heads=int(num_heads),
-        )
+    full_q_rows = bool(
+        materialized_part.get("full_q_rows", False)
+    ) and _overlap_row_plan_covers_full_query_rows(
+        row_plan, query_rows=int(q_group.shape[0]), B=int(B), num_heads=int(num_heads)
     )
     full_row_indices = materialized_part.get("full_row_indices", None)
     k_compact = materialized_part["k_compact"]
     v_compact = materialized_part["v_compact"]
     k_lens = materialized_part["k_lens"]
-    row_count = int(q_group.shape[0]) if full_q_rows else (
-        int(full_row_indices.numel()) if isinstance(full_row_indices, torch.Tensor) else 0
+    row_count = (
+        int(q_group.shape[0])
+        if full_q_rows
+        else int(full_row_indices.numel()) if isinstance(full_row_indices, torch.Tensor) else 0
     )
     if (
         not isinstance(k_lens, torch.Tensor)
         or not isinstance(k_compact, torch.Tensor)
-        or not isinstance(v_compact, torch.Tensor)
-        or k_lens.device != q_group.device
-        or k_lens.dtype != torch.int32
-        or row_count <= 0
-        or int(k_lens.numel()) != row_count
-        or k_compact.ndim not in (3, 4)
-        or tuple(k_compact.shape) != tuple(v_compact.shape)
+        or (not isinstance(v_compact, torch.Tensor))
+        or (k_lens.device != q_group.device)
+        or (k_lens.dtype != torch.int32)
+        or (row_count <= 0)
+        or (int(k_lens.numel()) != row_count)
+        or (k_compact.ndim not in (3, 4))
+        or (tuple(k_compact.shape) != tuple(v_compact.shape))
         or (k_compact.ndim == 4 and int(k_compact.shape[0]) != row_count)
     ):
         return None
@@ -4024,31 +2223,26 @@ def _run_compact_slot_plan_flash_attention_part_from_materialized(
         or full_row_indices.dtype != torch.long
     ):
         return None
-
-    if fast_lf_rope:
-        with _nvtx_range(kv_cache, f"horizonkv.{label_prefix}_lf_rope"):
-            k_rope = _apply_fast_lf_rope_to_row_materialized_k(
-                k_compact,
-                row_plan=row_plan,
-                batch_size=B,
-                frame_seqlen=int(materialized_part.get("frame_seqlen", 0) or 0),
-                k_lens=k_lens,
-                cu_seqlens=materialized_part.get("cu_seqlens_k", None),
-                rope_grid_sizes=rope_grid_sizes,
-                rope_freqs=rope_freqs,
-                inplace=True,
-                frame_positions_device=materialized_part.get("controls", {}).get("frame_positions"),
-                start_frame=int(lf_k_start_frame),
-            )
-        if k_rope is None:
-            return None
-        k_compact = k_rope
-
+    k_rope = _apply_fast_lf_rope_to_row_materialized_k(
+        k_compact,
+        row_plan=row_plan,
+        batch_size=B,
+        frame_seqlen=int(materialized_part.get("frame_seqlen", 0) or 0),
+        k_lens=k_lens,
+        cu_seqlens=materialized_part.get("cu_seqlens_k", None),
+        rope_grid_sizes=rope_grid_sizes,
+        rope_freqs=rope_freqs,
+        inplace=True,
+        frame_positions_device=materialized_part.get("controls", {}).get("frame_positions"),
+        start_frame=int(lf_k_start_frame),
+    )
+    if k_rope is None:
+        return None
+    k_compact = k_rope
     if full_q_rows:
         q_part = q_group
     else:
-        with _nvtx_range(kv_cache, f"horizonkv.{label_prefix}_q_select"):
-            q_part = q_group.index_select(0, full_row_indices)
+        q_part = q_group.index_select(0, full_row_indices)
     flash_part = _run_blocksparse_attention_part_with_lse(
         kv_cache,
         label_prefix=label_prefix,
@@ -4063,24 +2257,25 @@ def _run_compact_slot_plan_flash_attention_part_from_materialized(
         selected_frames=selected_frames,
     )
     if flash_part is None:
-        with _nvtx_range(kv_cache, f"horizonkv.{label_prefix}_flash_attn"):
-            flash_part = _flash_attention_varlen_with_lse_padded(
-                kv_cache=kv_cache,
-                q=q_part,
-                k=k_compact,
-                v=v_compact,
-                k_lens=k_lens,
-                cu_seqlens_k=materialized_part.get("cu_seqlens_k", None),
-                max_seqlen_k=materialized_part.get("max_seqlen_k", None),
-                all_full_length=bool(materialized_part.get("all_full_length", False)),
-            )
+        flash_part = _flash_attention_varlen_with_lse_padded(
+            kv_cache=kv_cache,
+            q=q_part,
+            k=k_compact,
+            v=v_compact,
+            k_lens=k_lens,
+            cu_seqlens_k=materialized_part.get("cu_seqlens_k", None),
+            max_seqlen_k=materialized_part.get("max_seqlen_k", None),
+            all_full_length=bool(materialized_part.get("all_full_length", False)),
+        )
     if flash_part is None:
         kv_cache["overlap_flash_lse_disabled"] = True
         return None
     out_part, lse_part = flash_part
     controls = materialized_part.get("controls")
     if isinstance(controls, dict):
-        _mark_overlap_control_workspaces_used(kv_cache, controls, torch.cuda.current_stream(q_group.device))
+        _mark_overlap_control_workspaces_used(
+            kv_cache, controls, torch.cuda.current_stream(q_group.device)
+        )
     if tuple(out_part.shape) != tuple(q_part.shape):
         kv_cache["overlap_flash_lse_disabled"] = True
         return None
@@ -4088,29 +2283,20 @@ def _run_compact_slot_plan_flash_attention_part_from_materialized(
         kv_cache["overlap_flash_lse_disabled"] = True
         return None
     if full_q_rows:
-        return out_part.to(dtype=out_dtype), lse_part.to(dtype=torch.float32)
-    with _nvtx_range(kv_cache, f"horizonkv.{label_prefix}_scatter"):
-        full_out = torch.zeros(
-            (int(q_group.shape[0]), Lq, q_heads, int(D)),
-            device=q_group.device,
-            dtype=out_dtype,
-        )
-        full_lse = torch.full(
-            (int(q_group.shape[0]), q_heads, Lq),
-            float("-inf"),
-            device=q_group.device,
-            dtype=torch.float32,
-        )
-        full_out.index_copy_(0, full_row_indices, out_part.to(dtype=out_dtype))
-        full_lse.index_copy_(0, full_row_indices, lse_part.to(dtype=torch.float32))
-    return full_out, full_lse
+        return (out_part.to(dtype=out_dtype), lse_part.to(dtype=torch.float32))
+    full_out = torch.zeros(
+        (int(q_group.shape[0]), Lq, q_heads, int(D)), device=q_group.device, dtype=out_dtype
+    )
+    full_lse = torch.full(
+        (int(q_group.shape[0]), q_heads, Lq), -1e309, device=q_group.device, dtype=torch.float32
+    )
+    full_out.index_copy_(0, full_row_indices, out_part.to(dtype=out_dtype))
+    full_lse.index_copy_(0, full_row_indices, lse_part.to(dtype=torch.float32))
+    return (full_out, full_lse)
 
 
 def _cached_flash_varlen_q_controls(
-    kv_cache: dict[str, Any] | None,
-    device: torch.device,
-    rows: int,
-    Lq: int,
+    kv_cache: dict[str, Any] | None, device: torch.device, rows: int, Lq: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     rows = int(rows)
     Lq = int(Lq)
@@ -4124,54 +2310,19 @@ def _cached_flash_varlen_q_controls(
             and len(cached) == 2
             and isinstance(cached[0], torch.Tensor)
             and isinstance(cached[1], torch.Tensor)
-            and cached[0].device == device
-            and cached[1].device == device
-            and cached[0].dtype == torch.int32
-            and cached[1].dtype == torch.int32
-            and int(cached[0].numel()) == rows
-            and int(cached[1].numel()) == rows + 1
+            and (cached[0].device == device)
+            and (cached[1].device == device)
+            and (cached[0].dtype == torch.int32)
+            and (cached[1].dtype == torch.int32)
+            and (int(cached[0].numel()) == rows)
+            and (int(cached[1].numel()) == rows + 1)
         ):
-            return cached[0], cached[1]
+            return (cached[0], cached[1])
     q_lens = torch.full((rows,), Lq, dtype=torch.int32, device=device)
     cu_seqlens_q = (torch.arange(rows + 1, dtype=torch.int32, device=device) * Lq).contiguous()
     if kv_cache is not None and isinstance(cache, dict):
         cache[key] = (q_lens, cu_seqlens_q)
-    return q_lens, cu_seqlens_q
-
-
-def _cached_flash_varlen_uniform_k_controls(
-    kv_cache: dict[str, Any] | None,
-    device: torch.device,
-    rows: int,
-    token_count: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    rows = int(rows)
-    token_count = int(token_count)
-    if kv_cache is not None:
-        device_index = int(device.index) if device.index is not None else -1
-        key = (str(device.type), device_index, rows, token_count)
-        cache = kv_cache.setdefault("_kv_sparse_flash_varlen_uniform_k_controls", {})
-        cached = cache.get(key, None) if isinstance(cache, dict) else None
-        if (
-            isinstance(cached, tuple)
-            and len(cached) == 2
-            and isinstance(cached[0], torch.Tensor)
-            and isinstance(cached[1], torch.Tensor)
-            and cached[0].device == device
-            and cached[1].device == device
-            and cached[0].dtype == torch.int32
-            and cached[1].dtype == torch.int32
-            and int(cached[0].numel()) == rows
-            and int(cached[1].numel()) == rows + 1
-        ):
-            return cached[0], cached[1]
-    k_lens = torch.full((rows,), token_count, dtype=torch.int32, device=device)
-    cu_seqlens_k = (
-        torch.arange(rows + 1, dtype=torch.int32, device=device) * token_count
-    ).contiguous()
-    if kv_cache is not None and isinstance(cache, dict):
-        cache[key] = (k_lens, cu_seqlens_k)
-    return k_lens, cu_seqlens_k
+    return (q_lens, cu_seqlens_q)
 
 
 def _flash_attention_varlen_with_lse_padded(
@@ -4185,8 +2336,6 @@ def _flash_attention_varlen_with_lse_padded(
     max_seqlen_k: int | None = None,
     all_full_length: bool,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    if flash_attn is None:
-        return None
     if q.device.type != "cuda" or k.device != q.device or v.device != q.device:
         return None
     if q.ndim != 4 or k.ndim not in (3, 4) or v.ndim != k.ndim:
@@ -4204,7 +2353,7 @@ def _flash_attention_varlen_with_lse_padded(
             return None
         token_count = int(max_seqlen_k)
         kv_heads = int(k.shape[1])
-    if rows <= 0 or Lq <= 0 or token_count <= 0 or q_heads <= 0 or kv_heads <= 0:
+    if rows <= 0 or Lq <= 0 or token_count <= 0 or (q_heads <= 0) or (kv_heads <= 0):
         return None
     if int(k.shape[-1]) != int(q.shape[-1]) or q_heads % kv_heads != 0:
         return None
@@ -4212,72 +2361,61 @@ def _flash_attention_varlen_with_lse_padded(
         return None
     if int(k_lens.numel()) != rows:
         return None
-
     half_dtypes = (torch.float16, torch.bfloat16)
     out_dtype = q.dtype
     dtype = q.dtype if q.dtype in half_dtypes else torch.bfloat16
     try:
-        with _nvtx_range(kv_cache, "horizonkv.flash_varlen_setup"):
-            _, cu_seqlens_q = _cached_flash_varlen_q_controls(kv_cache, q.device, rows, Lq)
-            k_lens = k_lens.to(device=k.device, dtype=torch.int32, non_blocking=True).contiguous()
-            q_flat = q.flatten(0, 1)
-            if q_flat.dtype not in half_dtypes:
-                q_flat = q_flat.to(dtype)
-
-            if k.ndim == 3:
-                k_flat = k
-                v_flat = v
-            elif bool(all_full_length):
-                k_flat = k.flatten(0, 1)
-                v_flat = v.flatten(0, 1)
-            else:
-                token_offsets = torch.arange(token_count, device=k.device).view(1, token_count)
-                valid_mask = token_offsets < k_lens.view(rows, 1)
-                k_flat = k[valid_mask]
-                v_flat = v[valid_mask]
-            if k_flat.dtype not in half_dtypes:
-                k_flat = k_flat.to(dtype)
-            if v_flat.dtype not in half_dtypes:
-                v_flat = v_flat.to(dtype)
-            q_flat = q_flat.to(v_flat.dtype)
-            k_flat = k_flat.to(v_flat.dtype)
-
-            if (
-                not isinstance(cu_seqlens_k, torch.Tensor)
-                or cu_seqlens_k.device != k.device
-                or cu_seqlens_k.dtype != torch.int32
-                or int(cu_seqlens_k.numel()) != rows + 1
-            ):
-                cu_seqlens_k = torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(
-                    0, dtype=torch.int32
-                )
-            else:
-                cu_seqlens_k = cu_seqlens_k.contiguous()
-        with _nvtx_range(kv_cache, "horizonkv.flash_varlen_call"):
-            out, softmax_lse, _ = flash_attn.flash_attn_varlen_func(
-                q=q_flat,
-                k=k_flat,
-                v=v_flat,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=Lq,
-                max_seqlen_k=token_count,
-                dropout_p=0.0,
-                softmax_scale=None,
-                causal=False,
-                window_size=(-1, -1),
-                deterministic=False,
-                return_attn_probs=True,
-            )
-        with _nvtx_range(kv_cache, "horizonkv.flash_varlen_unpack"):
-            out = out.unflatten(0, (rows, Lq)).type(out_dtype)
-            softmax_lse = (
-                softmax_lse.transpose(0, 1)
-                .contiguous()
-                .view(rows, Lq, q_heads)
-                .permute(0, 2, 1)
-            )
-        return out, softmax_lse
+        _, cu_seqlens_q = _cached_flash_varlen_q_controls(kv_cache, q.device, rows, Lq)
+        k_lens = k_lens.to(device=k.device, dtype=torch.int32, non_blocking=True).contiguous()
+        q_flat = q.flatten(0, 1)
+        if q_flat.dtype not in half_dtypes:
+            q_flat = q_flat.to(dtype)
+        if k.ndim == 3:
+            k_flat = k
+            v_flat = v
+        elif bool(all_full_length):
+            k_flat = k.flatten(0, 1)
+            v_flat = v.flatten(0, 1)
+        else:
+            token_offsets = torch.arange(token_count, device=k.device).view(1, token_count)
+            valid_mask = token_offsets < k_lens.view(rows, 1)
+            k_flat = k[valid_mask]
+            v_flat = v[valid_mask]
+        if k_flat.dtype not in half_dtypes:
+            k_flat = k_flat.to(dtype)
+        if v_flat.dtype not in half_dtypes:
+            v_flat = v_flat.to(dtype)
+        q_flat = q_flat.to(v_flat.dtype)
+        k_flat = k_flat.to(v_flat.dtype)
+        if (
+            not isinstance(cu_seqlens_k, torch.Tensor)
+            or cu_seqlens_k.device != k.device
+            or cu_seqlens_k.dtype != torch.int32
+            or (int(cu_seqlens_k.numel()) != rows + 1)
+        ):
+            cu_seqlens_k = torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(0, dtype=torch.int32)
+        else:
+            cu_seqlens_k = cu_seqlens_k.contiguous()
+        out, softmax_lse, _ = flash_attn.flash_attn_varlen_func(
+            q=q_flat,
+            k=k_flat,
+            v=v_flat,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=Lq,
+            max_seqlen_k=token_count,
+            dropout_p=0.0,
+            softmax_scale=None,
+            causal=False,
+            window_size=(-1, -1),
+            deterministic=False,
+            return_attn_probs=True,
+        )
+        out = out.unflatten(0, (rows, Lq)).type(out_dtype)
+        softmax_lse = (
+            softmax_lse.transpose(0, 1).contiguous().view(rows, Lq, q_heads).permute(0, 2, 1)
+        )
+        return (out, softmax_lse)
     except Exception:
         return None
 
@@ -4290,18 +2428,14 @@ def _merge_attention_partials(
     *,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
-    if merge_attention_lse_parts_triton is not None:
-        try:
-            merged = merge_attention_lse_parts_triton(
-                out_a.contiguous(),
-                lse_a.contiguous(),
-                out_b.contiguous(),
-                lse_b.contiguous(),
-            )
-        except Exception:
-            merged = None
-        if merged is not None:
-            return merged.to(dtype=out_dtype)
+    try:
+        merged = merge_attention_lse_parts_triton(
+            out_a.contiguous(), lse_a.contiguous(), out_b.contiguous(), lse_b.contiguous()
+        )
+    except Exception:
+        merged = None
+    if merged is not None:
+        return merged.to(dtype=out_dtype)
     merge_max = torch.maximum(lse_a, lse_b)
     both_invalid = torch.isneginf(merge_max)
     safe_merge_max = torch.where(both_invalid, torch.zeros_like(merge_max), merge_max)
@@ -4312,8 +2446,7 @@ def _merge_attention_partials(
     weight_b = torch.where(invalid_mask, torch.zeros_like(weight_b), weight_b)
     denom = (weight_a + weight_b).clamp_min_(1e-20)
     merged = (
-        out_a.to(dtype=torch.float32) * weight_a
-        + out_b.to(dtype=torch.float32) * weight_b
+        out_a.to(dtype=torch.float32) * weight_a + out_b.to(dtype=torch.float32) * weight_b
     ) / denom
     return merged.to(dtype=out_dtype)
 
@@ -4335,8 +2468,8 @@ def _kv_cache_wait_pending_cpu_copy_for_frames_on_stream(
     if not targets:
         return
     for event, span in records:
-        p0, p1 = int(span[0]), int(span[1])
-        if any(start < p1 and p0 < end for start, end in targets):
+        p0, p1 = (int(span[0]), int(span[1]))
+        if any((start < p1 and p0 < end for start, end in targets)):
             stream.wait_event(event)
 
 
@@ -4352,8 +2485,6 @@ def _build_compact_miss_stage(
     device: torch.device,
     dtype: torch.dtype,
 ) -> dict[str, Any] | None:
-    if copy_kv_frames_to_gpu_compact is None or copy_compact_to_gpu_slots_d2d is None:
-        return None
     active_rows_cpu = miss_row_plan.active_rows_cpu
     frame_plan_cpu = miss_row_plan.frame_plan_cpu
     active_count = int(active_rows_cpu.numel())
@@ -4361,31 +2492,26 @@ def _build_compact_miss_stage(
         return None
     if not isinstance(compact_scatter_plan, dict):
         return None
-
     valid_frames: torch.Tensor | None = None
     all_frames_full = compact_scatter_plan.get("all_frames_full", None)
     if not isinstance(all_frames_full, bool):
-        # Compatibility with an already-built older extension.  New planner
-        # builds perform this scan while constructing the compact scatter plan.
         valid_frames = frame_plan_cpu[frame_plan_cpu.ge(0)]
         if int(valid_frames.numel()) != int(miss_row_plan.item_count):
             return None
         all_frames_full = not bool(
             ((valid_frames + 1) * int(frame_seqlen) > int(total_tokens)).any().item()
         )
-    # The direct H2D interface does not pad a partial tail frame.
     if not all_frames_full:
         return None
-
     B = int(B)
     base_cu_seqlens_cpu = compact_scatter_plan.get("cu_seqlens_long", None)
     if (
         B == 1
         and isinstance(base_cu_seqlens_cpu, torch.Tensor)
-        and base_cu_seqlens_cpu.device.type == "cpu"
-        and base_cu_seqlens_cpu.dtype == torch.long
-        and base_cu_seqlens_cpu.ndim == 1
-        and int(base_cu_seqlens_cpu.numel()) == active_count + 1
+        and (base_cu_seqlens_cpu.device.type == "cpu")
+        and (base_cu_seqlens_cpu.dtype == torch.long)
+        and (base_cu_seqlens_cpu.ndim == 1)
+        and (int(base_cu_seqlens_cpu.numel()) == active_count + 1)
     ):
         cu_seqlens_cpu = base_cu_seqlens_cpu.contiguous()
     else:
@@ -4393,10 +2519,7 @@ def _build_compact_miss_stage(
         if B > 1:
             k_lens_cpu = k_lens_cpu.repeat(B)
         k_lens_cpu = k_lens_cpu.contiguous()
-        cu_seqlens_cpu = torch.empty(
-            (int(k_lens_cpu.numel()) + 1,),
-            dtype=torch.long,
-        )
+        cu_seqlens_cpu = torch.empty((int(k_lens_cpu.numel()) + 1,), dtype=torch.long)
         cu_seqlens_cpu[0] = 0
         torch.cumsum(k_lens_cpu, dim=0, out=cu_seqlens_cpu[1:])
     cu_seqlens_cpu = _pin_cpu_tensor_if_available(cu_seqlens_cpu)
@@ -4404,7 +2527,6 @@ def _build_compact_miss_stage(
     expected_tokens = B * int(miss_row_plan.item_count) * int(frame_seqlen)
     if packed_tokens != expected_tokens or packed_tokens <= 0:
         return None
-
     scatter_head_ids_cpu = compact_scatter_plan.get("scatter_head_ids", None)
     scatter_slot_ids_cpu = compact_scatter_plan.get("scatter_slot_ids", None)
     scatter_src_rows_cpu = compact_scatter_plan.get("scatter_src_rows", None)
@@ -4418,14 +2540,15 @@ def _build_compact_miss_stage(
     )
     expected = int(fill_count)
     if not all(
-        isinstance(tensor, torch.Tensor)
-        and tensor.device.type == "cpu"
-        and tensor.dtype == torch.long
-        and tensor.ndim == 1
-        and int(tensor.numel()) == expected
-        for tensor in scatter_tensors
+        (
+            isinstance(tensor, torch.Tensor)
+            and tensor.device.type == "cpu"
+            and (tensor.dtype == torch.long)
+            and (tensor.ndim == 1)
+            and (int(tensor.numel()) == expected)
+            for tensor in scatter_tensors
+        )
     ):
-        # Use normal onload if the extension lacks compact scatter planning.
         return None
     scatter_head_ids_cpu = _pin_cpu_tensor_if_available(scatter_head_ids_cpu.contiguous())
     scatter_slot_ids_cpu = _pin_cpu_tensor_if_available(scatter_slot_ids_cpu.contiguous())
@@ -4434,34 +2557,27 @@ def _build_compact_miss_stage(
     scatter_frames_from_planner = (
         isinstance(scatter_frame_ids_cpu, torch.Tensor)
         and scatter_frame_ids_cpu.device.type == "cpu"
-        and scatter_frame_ids_cpu.dtype == torch.long
-        and scatter_frame_ids_cpu.ndim == 1
-        and int(scatter_frame_ids_cpu.numel()) == expected
+        and (scatter_frame_ids_cpu.dtype == torch.long)
+        and (scatter_frame_ids_cpu.ndim == 1)
+        and (int(scatter_frame_ids_cpu.numel()) == expected)
     )
     if not scatter_frames_from_planner:
-        # Compatibility with an already-built older extension.  This is a
-        # single vectorized gather, not the former Python row/frame scan.
-        scatter_frame_ids_cpu = frame_plan_cpu[
-            scatter_src_rows_cpu,
-            scatter_src_cols_cpu,
-        ]
+        scatter_frame_ids_cpu = frame_plan_cpu[scatter_src_rows_cpu, scatter_src_cols_cpu]
     scatter_frame_ids_cpu = _pin_cpu_tensor_if_available(scatter_frame_ids_cpu.contiguous())
     if not scatter_frames_from_planner and bool(scatter_frame_ids_cpu.lt(0).any().item()):
         return None
-
     frame_ids_for_wait = compact_scatter_plan.get("frame_ids_for_wait", None)
     if not (
         isinstance(frame_ids_for_wait, torch.Tensor)
         and frame_ids_for_wait.device.type == "cpu"
-        and frame_ids_for_wait.dtype == torch.long
-        and frame_ids_for_wait.ndim == 1
+        and (frame_ids_for_wait.dtype == torch.long)
+        and (frame_ids_for_wait.ndim == 1)
     ):
         if valid_frames is None:
             valid_frames = frame_plan_cpu[frame_plan_cpu.ge(0)]
         frame_ids_for_wait = _pin_cpu_tensor_if_available(torch.unique(valid_frames))
     else:
         frame_ids_for_wait = _pin_cpu_tensor_if_available(frame_ids_for_wait.contiguous())
-
     compact_k = torch.empty((packed_tokens, 1, int(D)), device=device, dtype=dtype)
     compact_v = torch.empty_like(compact_k)
     return {
@@ -4485,6 +2601,7 @@ def _build_compact_miss_stage(
         "copy_done": None,
     }
 
+
 def _submit_compact_miss_h2d(
     kv_cache: dict[str, Any],
     *,
@@ -4498,25 +2615,21 @@ def _submit_compact_miss_h2d(
     try:
         with torch.cuda.stream(stream):
             _kv_cache_wait_pending_cpu_copy_for_frames_on_stream(
-                kv_cache,
-                stage["frame_ids_for_wait"],
-                frame_seqlen,
-                stream,
+                kv_cache, stage["frame_ids_for_wait"], frame_seqlen, stream
             )
-            with _nvtx_range(kv_cache, "horizonkv.overlap_compact_miss_h2d"):
-                copied = copy_kv_frames_to_gpu_compact(
-                    cpu_k=cpu_k,
-                    cpu_v=cpu_v,
-                    compact_k=stage["compact_k"],
-                    compact_v=stage["compact_v"],
-                    head_ids=stage["active_head_ids_cpu"],
-                    frame_ids=stage["frame_plan_cpu"],
-                    cu_seqlens=stage["cu_seqlens_cpu"],
-                    frame_seqlen=frame_seqlen,
-                    cpu_head_major=bool(kv_cache.get("cpu_cache_head_major", False)),
-                )
-                copy_done = torch.cuda.Event()
-                copy_done.record(stream)
+            copied = copy_kv_frames_to_gpu_compact(
+                cpu_k=cpu_k,
+                cpu_v=cpu_v,
+                compact_k=stage["compact_k"],
+                compact_v=stage["compact_v"],
+                head_ids=stage["active_head_ids_cpu"],
+                frame_ids=stage["frame_plan_cpu"],
+                cu_seqlens=stage["cu_seqlens_cpu"],
+                frame_seqlen=frame_seqlen,
+                cpu_head_major=True,
+            )
+            copy_done = torch.cuda.Event()
+            copy_done.record(stream)
         stage["copy_done"] = copy_done
         stage["compact_k"].record_stream(stream)
         stage["compact_v"].record_stream(stream)
@@ -4553,7 +2666,6 @@ def _submit_compact_miss_lf_rope(
     producer_event: torch.cuda.Event | None = None,
     lf_k_start_frame: int = 0,
 ) -> bool:
-    """Prepare miss RoPE concurrently with hits, using a separate output until raw slot fill completes."""
     copy_done = stage.get("copy_done", None)
     if copy_done is None or not isinstance(controls, dict):
         return False
@@ -4566,7 +2678,6 @@ def _submit_compact_miss_lf_rope(
         return False
     if not isinstance(rope_grid_sizes, torch.Tensor) or not isinstance(rope_freqs, torch.Tensor):
         return False
-
     try:
         with torch.cuda.stream(stream):
             if producer_event is not None:
@@ -4575,20 +2686,19 @@ def _submit_compact_miss_lf_rope(
             controls_ready_event = controls.get("ready_event", None)
             if controls_ready_event is not None:
                 stream.wait_event(controls_ready_event)
-            with _nvtx_range(kv_cache, "horizonkv.overlap_compact_miss_lf_rope_async"):
-                attention_k = _apply_fast_lf_rope_to_row_materialized_k(
-                    stage["compact_k"],
-                    row_plan=row_plan,
-                    batch_size=int(stage.get("batch_size", 0) or 0),
-                    frame_seqlen=int(stage.get("frame_seqlen", 0) or 0),
-                    k_lens=k_lens,
-                    cu_seqlens=cu_seqlens,
-                    rope_grid_sizes=rope_grid_sizes,
-                    rope_freqs=rope_freqs,
-                    inplace=False,
-                    frame_positions_device=controls.get("frame_positions"),
-                    start_frame=int(lf_k_start_frame),
-                )
+            attention_k = _apply_fast_lf_rope_to_row_materialized_k(
+                stage["compact_k"],
+                row_plan=row_plan,
+                batch_size=int(stage.get("batch_size", 0) or 0),
+                frame_seqlen=int(stage.get("frame_seqlen", 0) or 0),
+                k_lens=k_lens,
+                cu_seqlens=cu_seqlens,
+                rope_grid_sizes=rope_grid_sizes,
+                rope_freqs=rope_freqs,
+                inplace=False,
+                frame_positions_device=controls.get("frame_positions"),
+                start_frame=int(lf_k_start_frame),
+            )
             if not isinstance(attention_k, torch.Tensor):
                 return False
             _mark_overlap_control_workspaces_used(kv_cache, controls, stream)
@@ -4634,19 +2744,21 @@ def _run_compact_miss_attention_part(
         and B > 0
         and isinstance(k_lens_device, torch.Tensor)
         and isinstance(cu_seqlens_device, torch.Tensor)
-        and k_lens_device.device == q_group.device
-        and cu_seqlens_device.device == q_group.device
-        and k_lens_device.dtype == torch.int32
-        and cu_seqlens_device.dtype == torch.int32
-        and int(k_lens_device.numel()) == B * active_count
-        and int(cu_seqlens_device.numel()) == B * active_count + 1
+        and (k_lens_device.device == q_group.device)
+        and (cu_seqlens_device.device == q_group.device)
+        and (k_lens_device.dtype == torch.int32)
+        and (cu_seqlens_device.dtype == torch.int32)
+        and (int(k_lens_device.numel()) == B * active_count)
+        and (int(cu_seqlens_device.numel()) == B * active_count + 1)
     ):
         return None
-    if not full_q_rows and not (
-        isinstance(full_row_indices, torch.Tensor)
-        and full_row_indices.device == q_group.device
-        and full_row_indices.dtype == torch.long
-        and int(full_row_indices.numel()) == B * active_count
+    if not full_q_rows and (
+        not (
+            isinstance(full_row_indices, torch.Tensor)
+            and full_row_indices.device == q_group.device
+            and (full_row_indices.dtype == torch.long)
+            and (int(full_row_indices.numel()) == B * active_count)
+        )
     ):
         return None
     current_stream = torch.cuda.current_stream(q_group.device)
@@ -4659,40 +2771,33 @@ def _run_compact_miss_attention_part(
         current_stream.wait_event(attention_k_ready_event)
     Lq = int(q_group.shape[1])
     q_heads = int(q_group.shape[2])
-    full_q_rows = (
-        full_q_rows and B * active_count == int(q_group.shape[0])
-    )
+    full_q_rows = full_q_rows and B * active_count == int(q_group.shape[0])
     if full_q_rows:
         full_row_indices = None
         q_part = q_group
     else:
-        with _nvtx_range(kv_cache, "horizonkv.overlap_compact_miss_q_select"):
-            q_part = q_group.index_select(0, full_row_indices)
+        q_part = q_group.index_select(0, full_row_indices)
     attention_k = stage.get("attention_k", None)
-    if fast_lf_rope:
-        if not isinstance(attention_k, torch.Tensor):
-            row_plan = stage.get("row_plan", None)
-            if not isinstance(row_plan, _OverlapRowPlan):
-                return None
-            with _nvtx_range(kv_cache, "horizonkv.overlap_compact_miss_lf_rope"):
-                attention_k = _apply_fast_lf_rope_to_row_materialized_k(
-                    stage["compact_k"],
-                    row_plan=row_plan,
-                    batch_size=B,
-                    frame_seqlen=int(stage.get("frame_seqlen", 0) or 0),
-                    k_lens=k_lens_device,
-                    cu_seqlens=cu_seqlens_device,
-                    rope_grid_sizes=rope_grid_sizes,
-                    rope_freqs=rope_freqs,
-                    frame_positions_device=controls.get("frame_positions"),
-                    start_frame=int(lf_k_start_frame),
-                )
-            if attention_k is None:
-                return None
-            stage["attention_k"] = attention_k
-        attention_k.record_stream(current_stream)
-    else:
-        attention_k = stage["compact_k"]
+    if not isinstance(attention_k, torch.Tensor):
+        row_plan = stage.get("row_plan", None)
+        if not isinstance(row_plan, _OverlapRowPlan):
+            return None
+        attention_k = _apply_fast_lf_rope_to_row_materialized_k(
+            stage["compact_k"],
+            row_plan=row_plan,
+            batch_size=B,
+            frame_seqlen=int(stage.get("frame_seqlen", 0) or 0),
+            k_lens=k_lens_device,
+            cu_seqlens=cu_seqlens_device,
+            rope_grid_sizes=rope_grid_sizes,
+            rope_freqs=rope_freqs,
+            frame_positions_device=controls.get("frame_positions"),
+            start_frame=int(lf_k_start_frame),
+        )
+        if attention_k is None:
+            return None
+        stage["attention_k"] = attention_k
+    attention_k.record_stream(current_stream)
     flash_part = _run_blocksparse_attention_part_with_lse(
         kv_cache,
         label_prefix="overlap_compact_miss",
@@ -4707,23 +2812,23 @@ def _run_compact_miss_attention_part(
         selected_frames=selected_frames,
     )
     if flash_part is None:
-        with _nvtx_range(kv_cache, "horizonkv.overlap_compact_miss_attn"):
-            flash_part = _flash_attention_varlen_with_lse_padded(
-                kv_cache=kv_cache,
-                q=q_part,
-                k=attention_k,
-                v=stage["compact_v"],
-                k_lens=k_lens_device,
-                cu_seqlens_k=cu_seqlens_device,
-                max_seqlen_k=stage["max_seqlen_k"],
-                all_full_length=True,
-            )
+        flash_part = _flash_attention_varlen_with_lse_padded(
+            kv_cache=kv_cache,
+            q=q_part,
+            k=attention_k,
+            v=stage["compact_v"],
+            k_lens=k_lens_device,
+            cu_seqlens_k=cu_seqlens_device,
+            max_seqlen_k=stage["max_seqlen_k"],
+            all_full_length=True,
+        )
     if flash_part is None:
         return None
     out_part, lse_part = flash_part
-    if (
-        tuple(out_part.shape) != tuple(q_part.shape)
-        or tuple(lse_part.shape) != (int(q_part.shape[0]), q_heads, Lq)
+    if tuple(out_part.shape) != tuple(q_part.shape) or tuple(lse_part.shape) != (
+        int(q_part.shape[0]),
+        q_heads,
+        Lq,
     ):
         return None
     if full_q_rows:
@@ -4732,27 +2837,21 @@ def _run_compact_miss_attention_part(
         if isinstance(attention_k, torch.Tensor) and attention_k is not stage["compact_k"]:
             attention_k.record_stream(current_stream)
         stage["compact_v"].record_stream(current_stream)
-        return out_part.to(dtype=out_dtype), lse_part.to(dtype=torch.float32)
-    with _nvtx_range(kv_cache, "horizonkv.overlap_compact_miss_scatter"):
-        full_out = torch.zeros(
-            (int(q_group.shape[0]), Lq, q_heads, int(D)),
-            device=q_group.device,
-            dtype=out_dtype,
-        )
-        full_lse = torch.full(
-            (int(q_group.shape[0]), q_heads, Lq),
-            float("-inf"),
-            device=q_group.device,
-            dtype=torch.float32,
-        )
-        full_out.index_copy_(0, full_row_indices, out_part.to(dtype=out_dtype))
-        full_lse.index_copy_(0, full_row_indices, lse_part.to(dtype=torch.float32))
+        return (out_part.to(dtype=out_dtype), lse_part.to(dtype=torch.float32))
+    full_out = torch.zeros(
+        (int(q_group.shape[0]), Lq, q_heads, int(D)), device=q_group.device, dtype=out_dtype
+    )
+    full_lse = torch.full(
+        (int(q_group.shape[0]), q_heads, Lq), -1e309, device=q_group.device, dtype=torch.float32
+    )
+    full_out.index_copy_(0, full_row_indices, out_part.to(dtype=out_dtype))
+    full_lse.index_copy_(0, full_row_indices, lse_part.to(dtype=torch.float32))
     stage["compact_k"].record_stream(current_stream)
     _mark_overlap_control_workspaces_used(kv_cache, controls, current_stream)
     if isinstance(attention_k, torch.Tensor) and attention_k is not stage["compact_k"]:
         attention_k.record_stream(current_stream)
     stage["compact_v"].record_stream(current_stream)
-    return full_out, full_lse
+    return (full_out, full_lse)
 
 
 def _schedule_compact_miss_slot_fill(
@@ -4775,26 +2874,23 @@ def _schedule_compact_miss_slot_fill(
     with torch.cuda.stream(fill_stream):
         ready_event = source_ready_event if source_ready_event is not None else copy_done
         fill_stream.wait_event(ready_event)
-        with _nvtx_range(kv_cache, "horizonkv.overlap_compact_slot_fill_d2d"):
-            copied = copy_compact_to_gpu_slots_d2d(
-                compact_k=stage["compact_k"],
-                compact_v=stage["compact_v"],
-                gpu_k=gpu_k,
-                gpu_v=gpu_v,
-                head_ids=stage["scatter_head_ids_cpu"],
-                slot_ids=stage["scatter_slot_ids_cpu"],
-                src_rows=stage["scatter_src_rows_cpu"],
-                src_cols=stage["scatter_src_cols_cpu"],
-                cu_seqlens=stage["cu_seqlens_cpu"],
-                frame_seqlen=frame_seqlen,
-                gpu_cache_frames=gpu_cache_frames,
-                )
+        copied = copy_compact_to_gpu_slots_d2d(
+            compact_k=stage["compact_k"],
+            compact_v=stage["compact_v"],
+            gpu_k=gpu_k,
+            gpu_v=gpu_v,
+            head_ids=stage["scatter_head_ids_cpu"],
+            slot_ids=stage["scatter_slot_ids_cpu"],
+            src_rows=stage["scatter_src_rows_cpu"],
+            src_cols=stage["scatter_src_cols_cpu"],
+            cu_seqlens=stage["cu_seqlens_cpu"],
+            frame_seqlen=frame_seqlen,
+            gpu_cache_frames=gpu_cache_frames,
+        )
         slot_fill_done = torch.cuda.Event()
         slot_fill_done.record(fill_stream)
     if int(copied) != expected:
-        raise RuntimeError(
-            f"compact miss D2D slot fill copied {int(copied)} of {expected} items"
-        )
+        raise RuntimeError(f"compact miss D2D slot fill copied {int(copied)} of {expected} items")
     stage["compact_k"].record_stream(fill_stream)
     stage["compact_v"].record_stream(fill_stream)
     stage["slot_fill_done"] = slot_fill_done
@@ -4811,25 +2907,17 @@ def _identity_slot_indices_if_capacity_resident(
     live_start_index: int | None,
     live_len: int,
 ) -> torch.Tensor | None:
-    """Build a device-only slot plan during identity fill: frame f maps to slot f; live frames use -2."""
-    if _rolling_gpu_cache_enabled_by_env():
-        return None
-    if not (
-        _clean_gpu_fill_until_capacity_enabled_by_env()
-        or _clean_gpu_lru_insert_enabled_by_env()
-    ):
-        return None
     if (
         not isinstance(frame_indices, torch.Tensor)
         or frame_indices.device.type != "cuda"
         or frame_indices.dtype != torch.long
-        or frame_indices.ndim != 2
-        or int(frame_indices.shape[0]) <= 0
-        or int(frame_indices.shape[1]) <= 0
-        or int(frame_seqlen) <= 0
-        or int(gpu_cache_frames) <= 0
-        or live_start_index is None
-        or int(live_len) <= 0
+        or (frame_indices.ndim != 2)
+        or (int(frame_indices.shape[0]) <= 0)
+        or (int(frame_indices.shape[1]) <= 0)
+        or (int(frame_seqlen) <= 0)
+        or (int(gpu_cache_frames) <= 0)
+        or (live_start_index is None)
+        or (int(live_len) <= 0)
     ):
         return None
     live_start = int(live_start_index)
@@ -4843,23 +2931,14 @@ def _identity_slot_indices_if_capacity_resident(
     identity_filled = kv_cache.get("gpu_identity_filled_frames", None)
     if not isinstance(identity_filled, int) or int(identity_filled) < history_frames:
         return None
-    # LRU hit timestamps are only relevant after the identity phase.  If a
-    # caller explicitly requests hit timestamp commits, retain the planner.
     if _truthy_env("HORIZONKV_COMMIT_HIT_LAST_USED", "0"):
         return None
-
     frame_indices = frame_indices.contiguous()
     live_first = history_frames
     live_last = live_first + live_len // frame_seqlen
-    live_mask = (
-        frame_indices.ge(0)
-        & frame_indices.ge(live_first)
-        & frame_indices.lt(live_last)
-    )
+    live_mask = frame_indices.ge(0) & frame_indices.ge(live_first) & frame_indices.lt(live_last)
     return torch.where(
-        live_mask,
-        torch.full((), -2, dtype=torch.long, device=frame_indices.device),
-        frame_indices,
+        live_mask, torch.full((), -2, dtype=torch.long, device=frame_indices.device), frame_indices
     ).contiguous()
 
 
@@ -4884,38 +2963,27 @@ def _overlapped_attention_from_gpu_slots_if_possible_impl(
     staged_frame_indices: dict[str, Any] | None = None,
     lf_k_start_frame: int = 0,
 ) -> torch.Tensor | None:
-    # Wait for rolling clean-frame D2D commits as well as planner metadata.
-    if not slot_metadata_ready or _rolling_gpu_cache_enabled_by_env():
+    if not slot_metadata_ready:
         _kv_cache_wait_pending_slot_metadata_commit(kv_cache)
-    use_flash_materialize_env = _overlap_flash_materialize_enabled_by_env()
-    rolling_no_lru = _rolling_gpu_cache_enabled_by_env()
     gpu_cache_frames = int(kv_cache.get("gpu_cache_frames", 0) or 0)
     gpu_k = kv_cache.get("gpu_k", None)
     gpu_v = kv_cache.get("gpu_v", None)
-
     cpu_k = kv_cache["cpu_k"]
     cpu_v = kv_cache["cpu_v"]
-
-    head_major = bool(kv_cache.get("cpu_cache_head_major", False))
-    total_tokens = int(cpu_k.shape[2] if head_major else cpu_k.shape[1])
+    total_tokens = int(cpu_k.shape[2])
     B = int(cpu_k.shape[0])
-    num_heads = int(cpu_k.shape[1] if head_major else cpu_k.shape[2])
+    num_heads = int(cpu_k.shape[1])
     D = int(cpu_k.shape[-1])
     frame_seqlen = int(frame_seqlen)
-    has_live = live_k is not None and live_v is not None and live_start_index is not None
-
+    has_live = live_k is not None and live_v is not None and (live_start_index is not None)
     if frame_indices.ndim == 1:
         frame_indices = frame_indices.unsqueeze(0)
-
     if frame_indices.shape[0] == 1 and num_heads > 1:
         frame_indices = frame_indices.expand(num_heads, -1)
-
-    # During initial fill, frame f resides in slot f; skip CPU planning.
     if (
-        use_flash_materialize_env
-        and isinstance(gpu_k, torch.Tensor)
+        isinstance(gpu_k, torch.Tensor)
         and isinstance(gpu_v, torch.Tensor)
-        and gpu_k.device.type == "cuda"
+        and (gpu_k.device.type == "cuda")
     ):
         identity_slots = _identity_slot_indices_if_capacity_resident(
             kv_cache,
@@ -4928,160 +2996,112 @@ def _overlapped_attention_from_gpu_slots_if_possible_impl(
         if identity_slots is not None:
             if not q_group.is_contiguous():
                 q_group = q_group.contiguous()
-            with _nvtx_range(kv_cache, "horizonkv.overlap_identity_slot_plan"):
-                identity_out = _run_materialized_slot_plan_flash_attention(
-                    kv_cache,
-                    q_group=q_group,
-                    gpu_k=gpu_k,
-                    gpu_v=gpu_v,
-                    frame_indices_cpu=None,
-                    slot_plan_cpu=None,
-                    B=B,
-                    D=D,
-                    total_tokens=total_tokens,
-                    num_heads=num_heads,
-                    gpu_cache_frames=gpu_cache_frames,
-                    frame_seqlen=frame_seqlen,
-                    live_k=live_k,
-                    live_v=live_v,
-                    live_start_index=live_start_index,
-                    frame_indices_device=frame_indices,
-                    slot_indices_device=identity_slots,
-                    out_dtype=out_dtype,
-                    kv_sparse_config=kv_sparse_config,
-                    fast_lf_rope=fast_lf_rope,
-                    rope_grid_sizes=rope_grid_sizes,
-                    rope_freqs=rope_freqs,
-                    layer_idx=layer_idx,
-                    num_frame_per_block=num_frame_per_block,
-                    sink_tokens=sink_tokens,
-                    lf_k_start_frame=int(lf_k_start_frame),
-                )
+            identity_out = _run_materialized_slot_plan_flash_attention(
+                kv_cache,
+                q_group=q_group,
+                gpu_k=gpu_k,
+                gpu_v=gpu_v,
+                frame_indices_cpu=None,
+                slot_plan_cpu=None,
+                B=B,
+                D=D,
+                total_tokens=total_tokens,
+                num_heads=num_heads,
+                gpu_cache_frames=gpu_cache_frames,
+                frame_seqlen=frame_seqlen,
+                live_k=live_k,
+                live_v=live_v,
+                live_start_index=live_start_index,
+                frame_indices_device=frame_indices,
+                slot_indices_device=identity_slots,
+                out_dtype=out_dtype,
+                kv_sparse_config=kv_sparse_config,
+                fast_lf_rope=True,
+                rope_grid_sizes=rope_grid_sizes,
+                rope_freqs=rope_freqs,
+                layer_idx=layer_idx,
+                num_frame_per_block=num_frame_per_block,
+                sink_tokens=sink_tokens,
+                lf_k_start_frame=int(lf_k_start_frame),
+            )
             if identity_out is not None:
                 return identity_out
-
-    with _nvtx_range(kv_cache, "horizonkv.overlap_frame_indices_d2h"):
-        if staged_frame_indices is None:
-            with _nvtx_range(kv_cache, "horizonkv.overlap_frame_indices_d2h_submit"):
-                staged_frame_indices = _stage_overlap_frame_indices_to_cpu_async(
-                    kv_cache,
-                    frame_indices,
-                )
-
-        # Queue the query-layout copy after metadata D2H so the work can overlap.
-        if not q_group.is_contiguous():
-            q_group = q_group.contiguous()
-
-        with _nvtx_range(kv_cache, "horizonkv.overlap_frame_indices_d2h_wait"):
-            frame_indices_cpu = _resolve_staged_overlap_frame_indices_cpu(
-                staged_frame_indices,
+    if staged_frame_indices is None:
+        staged_frame_indices = _stage_overlap_frame_indices_to_cpu_async(kv_cache, frame_indices)
+    if not q_group.is_contiguous():
+        q_group = q_group.contiguous()
+    frame_indices_cpu = _resolve_staged_overlap_frame_indices_cpu(staged_frame_indices)
+    if frame_indices_cpu is None:
+        try:
+            frame_indices_cpu = torch.empty(
+                tuple(frame_indices.shape), dtype=torch.long, device="cpu", pin_memory=True
             )
-        if frame_indices_cpu is None:
-            with _nvtx_range(kv_cache, "horizonkv.overlap_frame_indices_d2h_fallback"):
-                try:
-                    frame_indices_cpu = torch.empty(
-                        tuple(frame_indices.shape),
-                        dtype=torch.long,
-                        device="cpu",
-                        pin_memory=True,
-                    )
-                except RuntimeError:
-                    frame_indices_cpu = torch.empty(
-                        tuple(frame_indices.shape),
-                        dtype=torch.long,
-                        device="cpu",
-                    )
-                frame_indices_cpu.copy_(frame_indices.detach(), non_blocking=False)
-
+        except RuntimeError:
+            frame_indices_cpu = torch.empty(
+                tuple(frame_indices.shape), dtype=torch.long, device="cpu"
+            )
+        frame_indices_cpu.copy_(frame_indices.detach(), non_blocking=False)
     live_start = int(live_start_index) if live_start_index is not None else None
     slot_state_tensors = _kv_cache_slot_state_tensors(kv_cache)
     if slot_state_tensors is None:
         return None
-    frame_to_slot_tensor, slot_frame_ids_tensor, slot_frame_lens_tensor, slot_last_used_tensor = slot_state_tensors
-    with _nvtx_range(kv_cache, "horizonkv.overlap_host_plan_tensor_cpp"):
-        plan_result = plan_kv_frame_slots_tensor(
-            frame_indices=frame_indices_cpu,
-            frame_to_slot=frame_to_slot_tensor,
-            slot_frame_ids=slot_frame_ids_tensor,
-            slot_frame_lens=slot_frame_lens_tensor,
-            slot_last_used=slot_last_used_tensor,
-            total_tokens=total_tokens,
-            frame_seqlen=frame_seqlen,
-            num_heads=num_heads,
-            gpu_cache_frames=gpu_cache_frames,
-            live_start_index=int(live_start or 0),
-            live_len=int(live_k.shape[1]) if live_k is not None else 0,
-            has_live=bool(has_live),
-            gpu_clock=int(kv_cache.get("gpu_clock", 0) or 0),
-            build_compact_plans=(
-                use_flash_materialize_env
-                and _overlap_flash_split_attention_enabled_by_env()
-                and fused_kv_frame_materialize is not None
-                and not bool(kv_cache.get("fused_onload_disabled", False))
-                and flash_attn is not None
-                and bool(has_live)
-                and 0 < D <= 256
-            ),
-            split_min_miss_items=(
-                0 if rolling_no_lru else _overlap_split_min_miss_items_by_env()
-            ),
-            split_min_miss_ratio=(
-                0.0 if rolling_no_lru else _overlap_split_min_miss_ratio_by_env()
-            ),
-        )
-        overlap_plan = (
-            _build_overlap_slot_plan(
-                plan_result=plan_result,
-                frame_indices_cpu=frame_indices_cpu,
-            )
-            if plan_result is not None
-            else None
-        )
+    frame_to_slot_tensor, slot_frame_ids_tensor, slot_frame_lens_tensor, slot_last_used_tensor = (
+        slot_state_tensors
+    )
+    plan_result = plan_kv_frame_slots_tensor(
+        frame_indices=frame_indices_cpu,
+        frame_to_slot=frame_to_slot_tensor,
+        slot_frame_ids=slot_frame_ids_tensor,
+        slot_frame_lens=slot_frame_lens_tensor,
+        slot_last_used=slot_last_used_tensor,
+        total_tokens=total_tokens,
+        frame_seqlen=frame_seqlen,
+        num_heads=num_heads,
+        gpu_cache_frames=gpu_cache_frames,
+        live_start_index=int(live_start or 0),
+        live_len=int(live_k.shape[1]) if live_k is not None else 0,
+        has_live=bool(has_live),
+        gpu_clock=int(kv_cache.get("gpu_clock", 0) or 0),
+        build_compact_plans=_overlap_flash_split_attention_enabled_by_env()
+        and (not bool(kv_cache.get("fused_onload_disabled", False)))
+        and bool(has_live)
+        and (0 < D <= 256),
+        split_min_miss_items=_overlap_split_min_miss_items_by_env(),
+        split_min_miss_ratio=0.0,
+    )
+    overlap_plan = (
+        _build_overlap_slot_plan(plan_result=plan_result, frame_indices_cpu=frame_indices_cpu)
+        if plan_result is not None
+        else None
+    )
     if plan_result is None:
         return None
     if overlap_plan is None:
         return None
     hit_item_count = int(overlap_plan.hit_item_count)
     miss_item_count = int(overlap_plan.miss_item_count)
-
     slot_plan_cpu = overlap_plan.slot_plan_cpu
-    use_materialized_flash = (
-        use_flash_materialize_env
-        and fused_kv_frame_materialize is not None
-        and not bool(kv_cache.get("fused_onload_disabled", False))
-    )
-
+    use_materialized_flash = not bool(kv_cache.get("fused_onload_disabled", False))
     can_flash_split_attention = (
         use_materialized_flash
         and _overlap_flash_split_attention_enabled_by_env()
-        and flash_attn is not None
         and bool(has_live)
-        and live_k is not None
-        and live_v is not None
-        and live_start_index is not None
-        and int(D) > 0
-        and int(D) <= 256
-        and hit_item_count > 0
-        and miss_item_count > 0
+        and (live_k is not None)
+        and (live_v is not None)
+        and (live_start_index is not None)
+        and (int(D) > 0)
+        and (int(D) <= 256)
+        and (hit_item_count > 0)
+        and (miss_item_count > 0)
     )
-
     split_miss_worthwhile = _overlap_split_worthwhile_for_miss_counts(
         hit_item_count=hit_item_count,
         miss_item_count=miss_item_count,
         miss_copy_count=int(overlap_plan.fill_count),
     )
-    if not split_miss_worthwhile and not rolling_no_lru:
+    if not split_miss_worthwhile:
         can_flash_split_attention = False
-
-    can_compact_onload = (
-        can_flash_split_attention
-        and _overlap_compact_onload_enabled_by_env()
-        and copy_kv_frames_to_gpu_compact is not None
-        and (rolling_no_lru or copy_compact_to_gpu_slots_d2d is not None)
-        and int(overlap_plan.fill_count) > 0
-    )
-
-
+    can_compact_onload = can_flash_split_attention and int(overlap_plan.fill_count) > 0
     hit_row_plan: _OverlapRowPlan | None = overlap_plan.hit_row_plan
     miss_row_plan: _OverlapRowPlan | None = overlap_plan.miss_row_plan
     flash_hit_controls: dict[str, Any] | None = None
@@ -5090,50 +3110,23 @@ def _overlapped_attention_from_gpu_slots_if_possible_impl(
     compact_stage: dict[str, Any] | None = None
     compact_h2d_done_event: torch.cuda.Event | None = None
     compact_slot_fill_scheduled = False
-
     next_clock = int(plan_result.get("gpu_clock", int(kv_cache.get("gpu_clock", 0) or 0)))
-
 
     def _commit_planned_slot_state() -> bool:
         if _kv_cache_commit_incremental_tensor_slot_plan_state(
-            kv_cache,
-            plan_result,
-            next_clock,
-            frame_seqlen=frame_seqlen,
-            total_tokens=total_tokens,
+            kv_cache, plan_result, next_clock, frame_seqlen=frame_seqlen, total_tokens=total_tokens
         ):
             return True
-        return _kv_cache_commit_tensor_slot_plan_state(
-            kv_cache,
-            plan_result,
-            next_clock,
-        )
+        return _kv_cache_commit_tensor_slot_plan_state(kv_cache, plan_result, next_clock)
 
     def _ensure_flash_miss_controls() -> bool:
         nonlocal flash_miss_controls
         if flash_miss_controls is None and miss_row_plan is not None:
             miss_control_stream = _shared_cuda_stream(
-                device=gpu_k.device,
-                name="overlap_flash_miss_control_h2d",
+                device=gpu_k.device, name="overlap_flash_miss_control_h2d"
             )
             if miss_control_stream is not None:
                 with torch.cuda.stream(miss_control_stream):
-                    with _nvtx_range(kv_cache, "horizonkv.overlap_flash_miss_control_h2d"):
-                        flash_miss_controls = _prepare_compact_slot_plan_controls(
-                            kv_cache,
-                            device=gpu_k.device,
-                            row_plan=miss_row_plan,
-                            B=B,
-                            num_heads=num_heads,
-                            frame_seqlen=frame_seqlen,
-                            workspace_name="miss",
-                        )
-                if isinstance(flash_miss_controls, dict):
-                    miss_ready_event = torch.cuda.Event()
-                    miss_ready_event.record(miss_control_stream)
-                    flash_miss_controls["ready_event"] = miss_ready_event
-            else:
-                with _nvtx_range(kv_cache, "horizonkv.overlap_flash_miss_control_h2d"):
                     flash_miss_controls = _prepare_compact_slot_plan_controls(
                         kv_cache,
                         device=gpu_k.device,
@@ -5143,40 +3136,33 @@ def _overlapped_attention_from_gpu_slots_if_possible_impl(
                         frame_seqlen=frame_seqlen,
                         workspace_name="miss",
                     )
+                if isinstance(flash_miss_controls, dict):
+                    miss_ready_event = torch.cuda.Event()
+                    miss_ready_event.record(miss_control_stream)
+                    flash_miss_controls["ready_event"] = miss_ready_event
+            else:
+                flash_miss_controls = _prepare_compact_slot_plan_controls(
+                    kv_cache,
+                    device=gpu_k.device,
+                    row_plan=miss_row_plan,
+                    B=B,
+                    num_heads=num_heads,
+                    frame_seqlen=frame_seqlen,
+                    workspace_name="miss",
+                )
         return isinstance(flash_miss_controls, dict)
 
     if can_flash_split_attention:
         if hit_row_plan is None or miss_row_plan is None:
-            # Compact hit/miss plans are produced by the tensor-native C++
-            # planner.  Do not rescan and repack them in Python on the hot path.
             can_flash_split_attention = False
         elif hit_row_plan.item_count <= 0 or miss_row_plan.item_count <= 0:
             can_flash_split_attention = False
         else:
             hit_control_stream = _shared_cuda_stream(
-                device=gpu_k.device,
-                name="overlap_flash_hit_control_h2d",
+                device=gpu_k.device, name="overlap_flash_hit_control_h2d"
             )
             if hit_control_stream is not None:
                 with torch.cuda.stream(hit_control_stream):
-                    with _nvtx_range(kv_cache, "horizonkv.overlap_flash_hit_control_h2d"):
-                        flash_hit_controls = _prepare_compact_slot_plan_controls(
-                            kv_cache,
-                            device=gpu_k.device,
-                            row_plan=hit_row_plan,
-                            B=B,
-                            num_heads=num_heads,
-                            frame_seqlen=frame_seqlen,
-                            workspace_name="hit",
-                        )
-                if flash_hit_controls is None:
-                    can_flash_split_attention = False
-                else:
-                    flash_control_tensors_ready_event = torch.cuda.Event()
-                    flash_control_tensors_ready_event.record(hit_control_stream)
-                    flash_hit_controls["ready_event"] = flash_control_tensors_ready_event
-            else:
-                with _nvtx_range(kv_cache, "horizonkv.overlap_flash_hit_control_h2d"):
                     flash_hit_controls = _prepare_compact_slot_plan_controls(
                         kv_cache,
                         device=gpu_k.device,
@@ -5188,58 +3174,64 @@ def _overlapped_attention_from_gpu_slots_if_possible_impl(
                     )
                 if flash_hit_controls is None:
                     can_flash_split_attention = False
+                else:
+                    flash_control_tensors_ready_event = torch.cuda.Event()
+                    flash_control_tensors_ready_event.record(hit_control_stream)
+                    flash_hit_controls["ready_event"] = flash_control_tensors_ready_event
+            else:
+                flash_hit_controls = _prepare_compact_slot_plan_controls(
+                    kv_cache,
+                    device=gpu_k.device,
+                    row_plan=hit_row_plan,
+                    B=B,
+                    num_heads=num_heads,
+                    frame_seqlen=frame_seqlen,
+                    workspace_name="hit",
+                )
+                if flash_hit_controls is None:
+                    can_flash_split_attention = False
                 elif torch.cuda.is_available():
                     flash_control_tensors_ready_event = torch.cuda.Event()
-                    flash_control_tensors_ready_event.record(torch.cuda.current_stream(gpu_k.device))
-
+                    flash_control_tensors_ready_event.record(
+                        torch.cuda.current_stream(gpu_k.device)
+                    )
     if not can_flash_split_attention or miss_row_plan is None:
         can_compact_onload = False
-
     if (
         can_compact_onload
         and hit_row_plan is not None
-        and miss_row_plan is not None
-        and flash_hit_controls is not None
+        and (miss_row_plan is not None)
+        and (flash_hit_controls is not None)
     ):
         compact_onload_stream = _shared_cuda_stream(
-            device=gpu_k.device,
-            name="overlap_compact_onload",
+            device=gpu_k.device, name="overlap_compact_onload"
         )
         compact_miss_rope_stream = _shared_cuda_stream(
-            device=gpu_k.device,
-            name="overlap_compact_miss_rope",
+            device=gpu_k.device, name="overlap_compact_miss_rope"
         )
         compact_h2d_submitted = False
         hit_materialized = None
-        # Prepare miss descriptors and buffers before launching hit attention.
-        with _nvtx_range(kv_cache, "horizonkv.overlap_build_compact_miss_stage_early"):
-            compact_stage = _build_compact_miss_stage(
-                miss_row_plan=miss_row_plan,
-                compact_scatter_plan=plan_result.get("compact_scatter_plan", None),
-                fill_count=overlap_plan.fill_count,
-                total_tokens=total_tokens,
-                B=B,
-                D=D,
-                frame_seqlen=frame_seqlen,
-                device=gpu_k.device,
-                dtype=gpu_k.dtype,
-            )
-        miss_controls_ready = _ensure_flash_miss_controls() if compact_stage is not None else False
-
-        serial_compact = (
-            not _overlap_attn_enabled_by_env()
-            or (rolling_no_lru and _rolling_gpu_cache_serial_split_enabled_by_env())
+        compact_stage = _build_compact_miss_stage(
+            miss_row_plan=miss_row_plan,
+            compact_scatter_plan=plan_result.get("compact_scatter_plan", None),
+            fill_count=overlap_plan.fill_count,
+            total_tokens=total_tokens,
+            B=B,
+            D=D,
+            frame_seqlen=frame_seqlen,
+            device=gpu_k.device,
+            dtype=gpu_k.dtype,
         )
-        # Capture input readiness before hit work. Recording this after hit
-        # attention would serialize miss RoPE behind hit completion.
+        miss_controls_ready = _ensure_flash_miss_controls() if compact_stage is not None else False
+        serial_compact = not _overlap_attn_enabled_by_env() or False
         rope_producer_event = None
-        if compact_stage is not None and miss_controls_ready and fast_lf_rope:
+        if compact_stage is not None and miss_controls_ready and True:
             rope_producer_event = torch.cuda.Event()
             rope_producer_event.record(torch.cuda.current_stream(gpu_k.device))
 
         def _submit_compact_miss() -> None:
             nonlocal compact_h2d_submitted, compact_h2d_done_event
-            if compact_stage is None or compact_onload_stream is None or not miss_controls_ready:
+            if compact_stage is None or compact_onload_stream is None or (not miss_controls_ready):
                 return
             compact_h2d_submitted = _submit_compact_miss_h2d(
                 kv_cache,
@@ -5250,7 +3242,7 @@ def _overlapped_attention_from_gpu_slots_if_possible_impl(
                 stream=compact_onload_stream,
             )
             compact_h2d_done_event = compact_stage.get("copy_done", None)
-            if compact_h2d_submitted and fast_lf_rope and compact_miss_rope_stream is not None:
+            if compact_h2d_submitted and compact_miss_rope_stream is not None:
                 _submit_compact_miss_lf_rope(
                     kv_cache,
                     stage=compact_stage,
@@ -5266,35 +3258,27 @@ def _overlapped_attention_from_gpu_slots_if_possible_impl(
 
         if serial_compact:
             _submit_compact_miss()
-
-        # The serial ablation keeps selection and LRU; wait for miss H2D/RoPE first.
-        if (
-            serial_compact
-            and compact_h2d_done_event is not None
-            and torch.cuda.is_available()
-        ):
+        if serial_compact and compact_h2d_done_event is not None and torch.cuda.is_available():
             torch.cuda.current_stream(gpu_k.device).wait_event(compact_h2d_done_event)
             miss_ready = compact_stage.get("attention_k_ready", None)
             if miss_ready is not None:
                 torch.cuda.current_stream(gpu_k.device).wait_event(miss_ready)
-
-        with _nvtx_range(kv_cache, "horizonkv.overlap_flash_hit_materialize"):
-            hit_materialized = _materialize_compact_slot_plan(
-                kv_cache,
-                gpu_k=gpu_k,
-                gpu_v=gpu_v,
-                row_plan=hit_row_plan,
-                B=B,
-                D=D,
-                total_tokens=total_tokens,
-                num_heads=num_heads,
-                gpu_cache_frames=gpu_cache_frames,
-                frame_seqlen=frame_seqlen,
-                live_k=live_k,
-                live_v=live_v,
-                live_start_index=live_start_index,
-                controls=flash_hit_controls,
-            )
+        hit_materialized = _materialize_compact_slot_plan(
+            kv_cache,
+            gpu_k=gpu_k,
+            gpu_v=gpu_v,
+            row_plan=hit_row_plan,
+            B=B,
+            D=D,
+            total_tokens=total_tokens,
+            num_heads=num_heads,
+            gpu_cache_frames=gpu_cache_frames,
+            frame_seqlen=frame_seqlen,
+            live_k=live_k,
+            live_v=live_v,
+            live_start_index=live_start_index,
+            controls=flash_hit_controls,
+        )
         if hit_materialized is not None:
             hit_part = _run_compact_slot_plan_flash_attention_part_from_materialized(
                 kv_cache,
@@ -5308,14 +3292,12 @@ def _overlapped_attention_from_gpu_slots_if_possible_impl(
                 out_dtype=out_dtype,
                 kv_sparse_config=kv_sparse_config,
                 selected_frames=int(frame_indices.shape[1]),
-                fast_lf_rope=fast_lf_rope,
+                fast_lf_rope=True,
                 rope_grid_sizes=rope_grid_sizes,
                 rope_freqs=rope_freqs,
                 lf_k_start_frame=int(lf_k_start_frame),
             )
             if hit_part is not None:
-                # Queue hit attention first so its GPU execution can hide
-                # host submission of the miss copies. Do not wait for hit.
                 if not serial_compact:
                     _submit_compact_miss()
                 if compact_h2d_submitted and compact_h2d_done_event is not None:
@@ -5329,7 +3311,7 @@ def _overlapped_attention_from_gpu_slots_if_possible_impl(
                             out_dtype=out_dtype or q_group.dtype,
                             kv_sparse_config=kv_sparse_config,
                             selected_frames=int(frame_indices.shape[1]),
-                            fast_lf_rope=fast_lf_rope,
+                            fast_lf_rope=True,
                             rope_grid_sizes=rope_grid_sizes,
                             rope_freqs=rope_freqs,
                             lf_k_start_frame=int(lf_k_start_frame),
@@ -5338,60 +3320,54 @@ def _overlapped_attention_from_gpu_slots_if_possible_impl(
                         else None
                     )
                     if miss_part is not None:
-                        # Submit miss attention before slot fill; fill waits until readers finish.
-                        if not rolling_no_lru:
-                            miss_read_done = torch.cuda.Event()
-                            miss_read_done.record(torch.cuda.current_stream(gpu_k.device))
-                            with _nvtx_range(kv_cache, "horizonkv.overlap_schedule_compact_slot_fill"):
-                                compact_slot_fill_scheduled = _schedule_compact_miss_slot_fill(
-                                    kv_cache,
-                                    stage=compact_stage,
-                                    gpu_k=gpu_k,
-                                    gpu_v=gpu_v,
-                                    frame_seqlen=frame_seqlen,
-                                    gpu_cache_frames=gpu_cache_frames,
-                                    source_ready_event=miss_read_done,
-                                )
-                            if compact_slot_fill_scheduled:
-                                with _nvtx_range(kv_cache, "horizonkv.overlap_queue_compact_slot_state_commit"):
-                                    queued = _kv_cache_queue_compact_stage_slots_commit(
-                                        kv_cache,
-                                        compact_stage,
-                                        frame_seqlen=frame_seqlen,
-                                        total_tokens=total_tokens,
-                                        ready_event=compact_stage.get("slot_fill_done", None),
-                                        device=gpu_k.device,
-                                    )
-                                    if queued:
-                                        compact_stage["_slot_state_committed"] = True
-                        with _nvtx_range(kv_cache, "horizonkv.overlap_compact_lse_merge"):
-                            compact_out = _merge_attention_partials(
-                                hit_part[0],
-                                hit_part[1],
-                                miss_part[0],
-                                miss_part[1],
-                                out_dtype=out_dtype or q_group.dtype,
+                        miss_read_done = torch.cuda.Event()
+                        miss_read_done.record(torch.cuda.current_stream(gpu_k.device))
+                        compact_slot_fill_scheduled = _schedule_compact_miss_slot_fill(
+                            kv_cache,
+                            stage=compact_stage,
+                            gpu_k=gpu_k,
+                            gpu_v=gpu_v,
+                            frame_seqlen=frame_seqlen,
+                            gpu_cache_frames=gpu_cache_frames,
+                            source_ready_event=miss_read_done,
+                        )
+                        if compact_slot_fill_scheduled:
+                            queued = _kv_cache_queue_compact_stage_slots_commit(
+                                kv_cache,
+                                compact_stage,
+                                frame_seqlen=frame_seqlen,
+                                total_tokens=total_tokens,
+                                ready_event=compact_stage.get("slot_fill_done", None),
+                                device=gpu_k.device,
                             )
-                        if compact_slot_fill_scheduled and not rolling_no_lru:
-                            with _nvtx_range(kv_cache, "horizonkv.overlap_compact_slot_state_commit"):
-                                committed = bool(compact_stage.get("_slot_state_committed", False))
-                                if not committed:
-                                    committed = _kv_cache_queue_compact_stage_slots_commit(
-                                        kv_cache,
-                                        compact_stage,
-                                        frame_seqlen=frame_seqlen,
-                                        total_tokens=total_tokens,
-                                        ready_event=compact_stage.get("slot_fill_done", None),
-                                        device=gpu_k.device,
-                                    )
-                                if not committed:
-                                    committed = _kv_cache_commit_compact_stage_slots(
-                                        kv_cache,
-                                        compact_stage,
-                                        frame_seqlen=frame_seqlen,
-                                        total_tokens=total_tokens,
-                                        device_wait_event=compact_stage.get("slot_fill_done", None),
-                                    )
+                            if queued:
+                                compact_stage["_slot_state_committed"] = True
+                        compact_out = _merge_attention_partials(
+                            hit_part[0],
+                            hit_part[1],
+                            miss_part[0],
+                            miss_part[1],
+                            out_dtype=out_dtype or q_group.dtype,
+                        )
+                        if compact_slot_fill_scheduled:
+                            committed = bool(compact_stage.get("_slot_state_committed", False))
+                            if not committed:
+                                committed = _kv_cache_queue_compact_stage_slots_commit(
+                                    kv_cache,
+                                    compact_stage,
+                                    frame_seqlen=frame_seqlen,
+                                    total_tokens=total_tokens,
+                                    ready_event=compact_stage.get("slot_fill_done", None),
+                                    device=gpu_k.device,
+                                )
+                            if not committed:
+                                committed = _kv_cache_commit_compact_stage_slots(
+                                    kv_cache,
+                                    compact_stage,
+                                    frame_seqlen=frame_seqlen,
+                                    total_tokens=total_tokens,
+                                    device_wait_event=compact_stage.get("slot_fill_done", None),
+                                )
                             if committed:
                                 compact_stage["_slot_state_committed"] = True
                         flush_deferred_clean_kv_offloads(kv_cache)
@@ -5399,22 +3375,12 @@ def _overlapped_attention_from_gpu_slots_if_possible_impl(
                     compact_h2d_done_event = None
         else:
             compact_h2d_done_event = None
-
-    if rolling_no_lru and miss_item_count > 0:
-        # The rolling cache cannot fall back to LRU miss insertion.
-        raise RuntimeError(
-            "HORIZONKV_GPU_CACHE_ROLLING requires the compact LF-RoPE split backend"
-        )
-
-
     onload_stream = _shared_cuda_stream(device=gpu_k.device, name="overlap_onload")
     assert onload_stream is not None
     if compact_h2d_done_event is not None:
         onload_stream.wait_event(compact_h2d_done_event)
     if flash_control_tensors_ready_event is not None:
         onload_stream.wait_event(flash_control_tensors_ready_event)
-
-
     onload_result: bool | None = None
     onload_done_event: torch.cuda.Event | None = None
 
@@ -5422,21 +3388,20 @@ def _overlapped_attention_from_gpu_slots_if_possible_impl(
         nonlocal onload_done_event
         with torch.cuda.device(gpu_k.device):
             torch.cuda.set_device(gpu_k.device)
-            with _nvtx_range(kv_cache, "horizonkv.overlap_onload"):
-                copied = _kv_cache_copy_frame_tensor_plan_from_cpu_to_slots(
-                    kv_cache,
-                    frame_indices_cpu=frame_indices_cpu,
-                    slot_plan_cpu=slot_plan_cpu,
-                    copy_plan_cpu=overlap_plan.copy_plan_cpu,
-                    expected_copies=overlap_plan.fill_count,
-                    frame_seqlen=frame_seqlen,
-                    stream=onload_stream,
-                )
-                if copied:
-                    with torch.cuda.stream(onload_stream):
-                        onload_done_event = torch.cuda.Event()
-                        onload_done_event.record(onload_stream)
-                return copied
+            copied = _kv_cache_copy_frame_tensor_plan_from_cpu_to_slots(
+                kv_cache,
+                frame_indices_cpu=frame_indices_cpu,
+                slot_plan_cpu=slot_plan_cpu,
+                copy_plan_cpu=overlap_plan.copy_plan_cpu,
+                expected_copies=overlap_plan.fill_count,
+                frame_seqlen=frame_seqlen,
+                stream=onload_stream,
+            )
+            if copied:
+                with torch.cuda.stream(onload_stream):
+                    onload_done_event = torch.cuda.Event()
+                    onload_done_event.record(onload_stream)
+            return copied
 
     def _finish_onload() -> bool:
         nonlocal onload_result
@@ -5474,7 +3439,7 @@ def _overlapped_attention_from_gpu_slots_if_possible_impl(
             slot_indices_device=None,
             out_dtype=out_dtype,
             kv_sparse_config=kv_sparse_config,
-            fast_lf_rope=fast_lf_rope,
+            fast_lf_rope=True,
             rope_grid_sizes=rope_grid_sizes,
             rope_freqs=rope_freqs,
             layer_idx=layer_idx,
@@ -5483,18 +3448,10 @@ def _overlapped_attention_from_gpu_slots_if_possible_impl(
             lf_k_start_frame=int(lf_k_start_frame),
         )
         if flash_out is not None:
-            if rolling_no_lru:
-                # All-hit rolling forwards read slots without touching LRU
-                # timestamps. Miss insertion is rejected above this branch.
-                flush_deferred_clean_kv_offloads(kv_cache)
-                return flash_out
-            with _nvtx_range(kv_cache, "horizonkv.overlap_commit_slot_state"):
-                slot_state_committed = _commit_planned_slot_state()
+            slot_state_committed = _commit_planned_slot_state()
             if not slot_state_committed:
                 return None
             return flash_out
-
-
     print("Error: flash failed")
     return None
 
@@ -5520,28 +3477,26 @@ def _overlapped_attention_from_gpu_slots_if_possible(
     staged_frame_indices: dict[str, Any] | None = None,
     lf_k_start_frame: int = 0,
 ) -> torch.Tensor | None:
-    """NVTX boundary covering one overlap attempt, including single-part paths."""
-    with _nvtx_range(kv_cache, "horizonkv.overlap_forward"):
-        return _overlapped_attention_from_gpu_slots_if_possible_impl(
-            kv_cache,
-            q_group,
-            frame_indices,
-            frame_seqlen,
-            live_k=live_k,
-            live_v=live_v,
-            live_start_index=live_start_index,
-            out_dtype=out_dtype,
-            slot_metadata_ready=slot_metadata_ready,
-            kv_sparse_config=kv_sparse_config,
-            fast_lf_rope=fast_lf_rope,
-            rope_grid_sizes=rope_grid_sizes,
-            rope_freqs=rope_freqs,
-            layer_idx=layer_idx,
-            num_frame_per_block=num_frame_per_block,
-            sink_tokens=sink_tokens,
-            staged_frame_indices=staged_frame_indices,
-            lf_k_start_frame=int(lf_k_start_frame),
-        )
+    return _overlapped_attention_from_gpu_slots_if_possible_impl(
+        kv_cache,
+        q_group,
+        frame_indices,
+        frame_seqlen,
+        live_k=live_k,
+        live_v=live_v,
+        live_start_index=live_start_index,
+        out_dtype=out_dtype,
+        slot_metadata_ready=slot_metadata_ready,
+        kv_sparse_config=kv_sparse_config,
+        fast_lf_rope=True,
+        rope_grid_sizes=rope_grid_sizes,
+        rope_freqs=rope_freqs,
+        layer_idx=layer_idx,
+        num_frame_per_block=num_frame_per_block,
+        sink_tokens=sink_tokens,
+        staged_frame_indices=staged_frame_indices,
+        lf_k_start_frame=int(lf_k_start_frame),
+    )
 
 
 def _cached_compulsory_indices_device(
@@ -5550,18 +3505,9 @@ def _cached_compulsory_indices_device(
     n_frames: int,
     device: torch.device,
 ) -> torch.Tensor:
-    values = tuple(
-        sorted(
-            {
-                int(v)
-                for v in compulsory_frames
-                if 0 <= int(v) < int(n_frames)
-            }
-        )
-    )
+    values = tuple(sorted({int(v) for v in compulsory_frames if 0 <= int(v) < int(n_frames)}))
     device_index = int(device.index) if device.index is not None else -1
     key = (str(device.type), device_index, int(n_frames), values)
-    # Share compulsory-frame IDs across layers to avoid repeated small H2D copies.
     cache = kv_cache.setdefault("_kv_sparse_compulsory_indices_device_cache", {})
     tensor = _COMPULSORY_INDICES_DEVICE_CACHE.get(key, None)
     if tensor is None and isinstance(cache, dict):
@@ -5569,8 +3515,8 @@ def _cached_compulsory_indices_device(
     if (
         isinstance(tensor, torch.Tensor)
         and tensor.device == device
-        and tensor.dtype == torch.long
-        and int(tensor.numel()) == len(values)
+        and (tensor.dtype == torch.long)
+        and (int(tensor.numel()) == len(values))
     ):
         ready = _COMPULSORY_INDICES_DEVICE_READY.get(key)
         if ready is not None and torch.cuda.is_available():
@@ -5578,37 +3524,32 @@ def _cached_compulsory_indices_device(
             if int(current_stream.cuda_stream) != int(ready[1]):
                 current_stream.wait_event(ready[0])
         return tensor
-    with _nvtx_range(kv_cache, "horizonkv.compulsory_indices_h2d"):
-        tensor = torch.empty((len(values),), device=device, dtype=torch.long)
-        if values:
-            cpu_cache = kv_cache.setdefault("_kv_sparse_compulsory_indices_cpu_cache", {})
-            cpu_tensor = cpu_cache.get(values, None) if isinstance(cpu_cache, dict) else None
-            if (
-                not isinstance(cpu_tensor, torch.Tensor)
-                or cpu_tensor.device.type != "cpu"
-                or cpu_tensor.dtype != torch.long
-                or int(cpu_tensor.numel()) != len(values)
-            ):
-                cpu_tensor = torch.tensor(values, device="cpu", dtype=torch.long)
-                if _can_pin_cpu_memory(device):
-                    try:
-                        cpu_tensor = cpu_tensor.pin_memory()
-                    except Exception:
-                        pass
-                if isinstance(cpu_cache, dict):
-                    cpu_cache[values] = cpu_tensor
-            tensor.copy_(
-                cpu_tensor,
-                non_blocking=bool(getattr(cpu_tensor, "is_pinned", lambda: False)()),
-            )
+    tensor = torch.empty((len(values),), device=device, dtype=torch.long)
+    if values:
+        cpu_cache = kv_cache.setdefault("_kv_sparse_compulsory_indices_cpu_cache", {})
+        cpu_tensor = cpu_cache.get(values, None) if isinstance(cpu_cache, dict) else None
+        if (
+            not isinstance(cpu_tensor, torch.Tensor)
+            or cpu_tensor.device.type != "cpu"
+            or cpu_tensor.dtype != torch.long
+            or (int(cpu_tensor.numel()) != len(values))
+        ):
+            cpu_tensor = torch.tensor(values, device="cpu", dtype=torch.long)
+            if _can_pin_cpu_memory(device):
+                try:
+                    cpu_tensor = cpu_tensor.pin_memory()
+                except Exception:
+                    pass
+            if isinstance(cpu_cache, dict):
+                cpu_cache[values] = cpu_tensor
+        tensor.copy_(
+            cpu_tensor, non_blocking=bool(getattr(cpu_tensor, "is_pinned", lambda: False)())
+        )
     if torch.cuda.is_available() and device.type == "cuda":
         producer_stream = torch.cuda.current_stream(device)
         ready_event = torch.cuda.Event()
         ready_event.record(producer_stream)
-        _COMPULSORY_INDICES_DEVICE_READY[key] = (
-            ready_event,
-            int(producer_stream.cuda_stream),
-        )
+        _COMPULSORY_INDICES_DEVICE_READY[key] = (ready_event, int(producer_stream.cuda_stream))
     if isinstance(cache, dict):
         cache[key] = tensor
     _COMPULSORY_INDICES_DEVICE_CACHE[key] = tensor
@@ -5626,12 +3567,6 @@ def _select_kv_frame_indices_max_kv_frames_batched_fused(
     max_kv_frames: int,
     compulsory_frames: set[int],
 ) -> torch.Tensor | None:
-    if select_pooled_qk_topk is None:
-        return None
-    if str(getattr(cfg, "frame_selection_score", "")) != "pooled_qk":
-        return None
-    if str(getattr(cfg, "rule", "")) != "max_kv_frames":
-        return None
     if frame_k_index_window is None or not isinstance(frame_k_index_window, torch.Tensor):
         return None
     if roped_query.device.type != "cuda" or frame_k_index_window.device != roped_query.device:
@@ -5645,10 +3580,7 @@ def _select_kv_frame_indices_max_kv_frames_batched_fused(
     if int(n_frames) <= 0 or int(frame_k_index_window.shape[1]) < int(n_frames):
         return None
     compulsory_indices = _cached_compulsory_indices_device(
-        kv_cache,
-        compulsory_frames,
-        n_frames,
-        roped_query.device,
+        kv_cache, compulsory_frames, n_frames, roped_query.device
     )
     try:
         selected = select_pooled_qk_topk(
@@ -5673,6 +3605,7 @@ def _select_kv_frame_indices_max_kv_frames_batched_fused(
     if selected.ndim != 2 or int(selected.shape[0]) != num_heads:
         return None
     return selected
+
 
 def _sparse_kv_self_attention_cpu_offload(
     *,
@@ -5707,14 +3640,13 @@ def _sparse_kv_self_attention_cpu_offload(
     cfg = kv_sparse_config
     score_query = selection_query if selection_query is not None else roped_query
     Lk = int(local_end_index)
-    if bool(getattr(cfg, "score_with_unroped_qk", False)) and cfg.granularity != "kv_frame":
-        raise ValueError("score_with_unroped_qk currently supports granularity=kv_frame only")
     n_frames = max(1, (Lk + frame_seqlen - 1) // frame_seqlen)
-
-    try:
-
-        sink_frames = _sink_frame_indices(Lk, kv_start, frame_seqlen, sink_tokens)
-        forced_frames = _mandatory_kv_frame_indices(
+    sink_frames = _sink_frame_indices(Lk, kv_start, frame_seqlen, sink_tokens)
+    forced_frames = _mandatory_kv_frame_indices(
+        Lk, frame_seqlen, kv_start, local_end_index, current_start, current_end, num_frame_per_block
+    )
+    forced_frames.update(
+        _preceding_kv_frame_indices(
             Lk,
             frame_seqlen,
             kv_start,
@@ -5722,194 +3654,106 @@ def _sparse_kv_self_attention_cpu_offload(
             current_start,
             current_end,
             num_frame_per_block,
+            None,
         )
-        forced_frames.update(
-            _preceding_kv_frame_indices(
-                Lk,
-                frame_seqlen,
-                kv_start,
-                local_end_index,
-                current_start,
-                current_end,
-                num_frame_per_block,
-                getattr(cfg, "mandatory_preceding_kv_frames", None),
+    )
+    forced_frames.update(
+        _recent_kv_frame_indices(Lk, frame_seqlen, getattr(cfg, "mandatory_recent_kv_frames", None))
+    )
+    compulsory_frames = set(sink_frames) | set(forced_frames)
+    selected_frame_idx: torch.Tensor | None = None
+    adaptive_metadata = None
+    frame_k_index_window = _overlay_live_frame_stats(
+        kv_cache.get("frame_k_mean", None),
+        live_frame_k_mean,
+        live_start_index=live_start_index,
+        frame_seqlen=frame_seqlen,
+        n_frames=n_frames,
+    )
+    shared_max_kv_frames = cfg.max_kv_frames
+    use_batched_selection = Lk % frame_seqlen == 0 and shared_max_kv_frames is not None
+    if use_batched_selection and selected_frame_idx is None:
+        if os.getenv("HORIZONKV_ADAPTIVE_CONFIG"):
+            from flagscale.inference.core.diffusion.horizonkv.algorithm.rasa import (
+                select_adaptive_frames_if_supported,
             )
-        )
-        forced_frames.update(
-            _recent_kv_frame_indices(
-                Lk,
-                frame_seqlen,
-                getattr(cfg, "mandatory_recent_kv_frames", None),
-            )
-        )
-        compulsory_frames = set(sink_frames) | set(forced_frames)
 
-
-        if (
-            cfg.granularity == "kv_frame"
-            and cfg.max_kv_frames > int(n_frames)
-            and not fast_lf_rope
-        ):
-            dense_out = _dense_attention_all_frames(
-                kv_cache,
-                roped_query,
-                Lk=Lk,
-                n_frames=n_frames,
+            adaptive_metadata = select_adaptive_frames_if_supported(
+                kv_cache=kv_cache,
+                cfg=cfg,
+                q=score_query,
+                frame_means=frame_k_index_window,
+                compulsory_frames=compulsory_frames,
                 frame_seqlen=frame_seqlen,
+                n_frames=n_frames,
+                live_start_index=live_start_index,
                 live_k=live_k,
-                live_v=live_v,
-                live_start_index=live_start_index,
-                out_dtype=out_dtype,
-                kv_sparse_config=cfg,
             )
-            return dense_out
-
-        selected_frame_idx: torch.Tensor | None = None
-        adaptive_metadata = None
-
-
-        if cfg.granularity == "kv_frame":
-            frame_k_index_window = _overlay_live_frame_stats(
-                kv_cache.get("frame_k_mean", None),
-                live_frame_k_mean,
-                live_start_index=live_start_index,
-                frame_seqlen=frame_seqlen,
+        if adaptive_metadata is not None:
+            cfg = adaptive_metadata["cfg"]
+            selected_frame_idx = adaptive_metadata["selected"]
+        else:
+            selected_frame_idx = _select_kv_frame_indices_max_kv_frames_batched_fused(
+                kv_cache,
+                cfg,
+                score_query,
+                frame_k_index_window,
                 n_frames=n_frames,
+                frame_seqlen=frame_seqlen,
+                max_kv_frames=int(shared_max_kv_frames),
+                compulsory_frames=compulsory_frames,
             )
-
-            shared_max_kv_frames = cfg.max_kv_frames
-
-            use_batched_selection = (
-                cfg.rule == "max_kv_frames"
-                and Lk % frame_seqlen == 0
-                and shared_max_kv_frames is not None
+    use_batched_max_kv_frames = Lk % frame_seqlen == 0 and shared_max_kv_frames is not None
+    if use_batched_max_kv_frames:
+        assert selected_frame_idx is not None
+        staged_frame_indices = None
+        if (
+            _overlap_attn_enabled_by_env()
+            and live_start_index is not None
+            and (
+                int(live_start_index) > int(kv_cache.get("gpu_cache_frames", 0) or 0) * frame_seqlen
             )
-            if use_batched_selection and selected_frame_idx is None:
-                select_range = (
-                    "horizonkv.frame_select_weighted_random"
-                    if cfg.frame_selection_strategy == "weighted_random"
-                    else "horizonkv.frame_select_fused"
+        ):
+            if adaptive_metadata is not None:
+                staged_frame_indices = adaptive_metadata["staged"]
+            else:
+                staged_frame_indices = _stage_overlap_frame_indices_to_cpu_async(
+                    kv_cache, selected_frame_idx
                 )
-                with _nvtx_range(kv_cache, select_range):
-                    if cfg.frame_selection_strategy == "weighted_random":
-                        if frame_k_index_window is None:
-                            raise RuntimeError(
-                                "weighted_random frame selection requires cached frame means"
-                            )
-                        pooled_scores = _per_frame_simple_mean_cached_k(
-                            score_query,
-                            frame_k_index_window,
-                            frame_seqlen,
-                        )
-                        selected_frame_idx = _select_kv_frame_indices_weighted_random_batched(
-                            pooled_scores,
-                            int(shared_max_kv_frames),
-                            n_frames,
-                            sink_frames,
-                            forced_frames,
-                        )
-                    else:
-                        if fast_lf_rope and os.getenv("HORIZONKV_ADAPTIVE_CONFIG"):
-                            from flagscale.inference.core.diffusion.horizonkv.algorithm.rasa import select_adaptive_frames_if_supported
-                            adaptive_metadata = select_adaptive_frames_if_supported(
-                                kv_cache=kv_cache,cfg=cfg,q=score_query,frame_means=frame_k_index_window,
-                                compulsory_frames=compulsory_frames,frame_seqlen=frame_seqlen,
-                                n_frames=n_frames,live_start_index=live_start_index,
-                                live_k=live_k)
-                        if adaptive_metadata is not None:
-                            cfg = adaptive_metadata["cfg"]
-                            selected_frame_idx = adaptive_metadata["selected"]
-                        else:
-                            selected_frame_idx = _select_kv_frame_indices_max_kv_frames_batched_fused(
-                                kv_cache,
-                                cfg,
-                                score_query,
-                                frame_k_index_window,
-                                n_frames=n_frames,
-                                frame_seqlen=frame_seqlen,
-                                max_kv_frames=int(shared_max_kv_frames),
-                                compulsory_frames=compulsory_frames,
-                            )
-
-            use_batched_max_kv_frames = (
-                cfg.rule == "max_kv_frames"
-                and Lk % frame_seqlen == 0
-                and shared_max_kv_frames is not None
-            )
-
-            if use_batched_max_kv_frames:
-                assert selected_frame_idx is not None
-
-                staged_frame_indices = None
-                if (
-                    fast_lf_rope
-                    and _overlap_attn_enabled_by_env()
-                    and live_start_index is not None
-                    and int(live_start_index) > int(kv_cache.get("gpu_cache_frames", 0) or 0) * frame_seqlen
-                ):
-                    # Selection is complete before Q RoPE. Submit its D2H now,
-                    # leaving query work available to overlap the host planner.
-                    with _nvtx_range(kv_cache, "horizonkv.overlap_frame_indices_d2h_submit"):
-                        if adaptive_metadata is not None:
-                            staged_frame_indices = adaptive_metadata["staged"]
-                        else:
-                            staged_frame_indices = _stage_overlap_frame_indices_to_cpu_async(
-                                kv_cache, selected_frame_idx,
-                            )
-                q_for_attention = roped_query
-                if fast_lf_rope:
-                    if rope_grid_sizes is None or rope_freqs is None:
-                        raise ValueError(
-                            "fast LF-RoPE requires rope_grid_sizes and rope_freqs"
-                        )
-                    selected_frames = int(selected_frame_idx.shape[1])
-                    query_frames = max(1, int(math.ceil(Lq / float(frame_seqlen))))
-                    current_start_frame = int(current_start) // int(frame_seqlen)
-                    # Keep Q on the original global timeline.  Compact KV is
-                    # anchored immediately before that timeline position, so
-                    # its final query-block frames still line up with Q.
-                    lf_k_start_frame = max(
-                        0,
-                        current_start_frame - max(0, selected_frames - query_frames),
-                    )
-                    q_for_attention = compacted_rope_apply(
-                        roped_query,
-                        rope_grid_sizes,
-                        rope_freqs,
-                        start_frame=current_start_frame,
-                    ).to(dtype=live_v.dtype if isinstance(live_v, torch.Tensor) else roped_query.dtype)
-                q_attn = q_for_attention.permute(0, 2, 1, 3).reshape(B * H, Lq, 1, D)
-
-                overlap_result = None
-                # OAE executes the RASA selection; OVERLAP_ATTN=0 serializes this same backend.
-                if fast_lf_rope or _overlap_attn_enabled_by_env() or (
-                    _rolling_gpu_cache_enabled_by_env()
-                    and _rolling_gpu_cache_serial_split_enabled_by_env()
-                ):
-                    overlap_result = _overlapped_attention_from_gpu_slots_if_possible(
-                        kv_cache,
-                        q_attn,
-                        selected_frame_idx,
-                        frame_seqlen,
-                        live_k=live_k,
-                        live_v=live_v,
-                        live_start_index=live_start_index,
-                        out_dtype=out_dtype,
-                        slot_metadata_ready=True,
-                        kv_sparse_config=cfg,
-                        fast_lf_rope=fast_lf_rope,
-                        rope_grid_sizes=rope_grid_sizes,
-                        rope_freqs=rope_freqs,
-                        lf_k_start_frame=lf_k_start_frame if fast_lf_rope else 0,
-                        layer_idx=layer_idx,
-                        num_frame_per_block=num_frame_per_block,
-                        sink_tokens=sink_tokens,
-                        staged_frame_indices=staged_frame_indices,
-                    )
-                if overlap_result is not None:
-                    return overlap_result.reshape(B, H, Lq, D).permute(0, 2, 1, 3)
-
-                raise RuntimeError("HorizonKV materialized attention failed; check the sparse and transfer extensions")
-
-    finally:
-        pass
+        q_for_attention = roped_query
+        if rope_grid_sizes is None or rope_freqs is None:
+            raise ValueError("fast LF-RoPE requires rope_grid_sizes and rope_freqs")
+        selected_frames = int(selected_frame_idx.shape[1])
+        query_frames = max(1, int(math.ceil(Lq / float(frame_seqlen))))
+        current_start_frame = int(current_start) // int(frame_seqlen)
+        lf_k_start_frame = max(0, current_start_frame - max(0, selected_frames - query_frames))
+        q_for_attention = compacted_rope_apply(
+            roped_query, rope_grid_sizes, rope_freqs, start_frame=current_start_frame
+        ).to(dtype=live_v.dtype if isinstance(live_v, torch.Tensor) else roped_query.dtype)
+        q_attn = q_for_attention.permute(0, 2, 1, 3).reshape(B * H, Lq, 1, D)
+        overlap_result = None
+        overlap_result = _overlapped_attention_from_gpu_slots_if_possible(
+            kv_cache,
+            q_attn,
+            selected_frame_idx,
+            frame_seqlen,
+            live_k=live_k,
+            live_v=live_v,
+            live_start_index=live_start_index,
+            out_dtype=out_dtype,
+            slot_metadata_ready=True,
+            kv_sparse_config=cfg,
+            fast_lf_rope=True,
+            rope_grid_sizes=rope_grid_sizes,
+            rope_freqs=rope_freqs,
+            lf_k_start_frame=lf_k_start_frame,
+            layer_idx=layer_idx,
+            num_frame_per_block=num_frame_per_block,
+            sink_tokens=sink_tokens,
+            staged_frame_indices=staged_frame_indices,
+        )
+        if overlap_result is not None:
+            return overlap_result.reshape(B, H, Lq, D).permute(0, 2, 1, 3)
+        raise RuntimeError(
+            "HorizonKV materialized attention failed; check the sparse and transfer extensions"
+        )

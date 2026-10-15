@@ -1,55 +1,39 @@
 # Modified for the HorizonKV inference artifact; see NOTICE.
-"""Compacted RoPE kernels used by HorizonKV (derived from LightForcing)."""
-
+"""Compacted RoPE kernels adapted from LightForcing."""
 from __future__ import annotations
-
-import os
-import warnings
-
 import torch
+import triton
+import triton.language as tl
 
-try:  # pragma: no cover - exercised only on CUDA environments
-    import triton
-    import triton.language as tl
-except Exception:  # pragma: no cover
-    triton = None
-    tl = None
-
-
-
-# Cache device geometry to avoid repeated small pageable H2D transfers.
 _LF_GRID_DEVICE_CACHE: dict[tuple[str, int, tuple[int, ...], tuple[int, ...]], torch.Tensor] = {}
 _LF_GRID_CPU_CACHE: dict[tuple[tuple[int, ...], tuple[int, ...]], torch.Tensor] = {}
 _LF_GRID_DEVICE_READY: dict[
-    tuple[str, int, tuple[int, ...], tuple[int, ...]],
-    tuple[torch.cuda.Event, int],
+    tuple[str, int, tuple[int, ...], tuple[int, ...]], tuple[torch.cuda.Event, int]
 ] = {}
 
 
-def _lf_grid_sizes_on_device(
-    grid_sizes: torch.Tensor,
-    device: torch.device,
-) -> torch.Tensor:
-    """Return a cached contiguous CUDA copy of the grid geometry."""
+def _lf_grid_sizes_on_device(grid_sizes: torch.Tensor, device: torch.device) -> torch.Tensor:
     if not isinstance(grid_sizes, torch.Tensor):
         raise TypeError("grid_sizes must be a tensor")
     device = torch.device(device)
-    if grid_sizes.device == device and grid_sizes.dtype == torch.int64 and grid_sizes.is_contiguous():
+    if (
+        grid_sizes.device == device
+        and grid_sizes.dtype == torch.int64
+        and grid_sizes.is_contiguous()
+    ):
         return grid_sizes
-
-    # Use value-based caching only for CPU metadata to avoid device synchronization.
     if grid_sizes.device.type != "cpu":
         return grid_sizes.to(device=device, dtype=torch.int64).contiguous()
-    values = tuple(int(v) for v in grid_sizes.detach().reshape(-1).tolist())
-    shape = tuple(int(v) for v in grid_sizes.shape)
+    values = tuple((int(v) for v in grid_sizes.detach().reshape(-1).tolist()))
+    shape = tuple((int(v) for v in grid_sizes.shape))
     device_index = int(device.index) if device.index is not None else -1
     key = (str(device.type), device_index, shape, values)
     cached = _LF_GRID_DEVICE_CACHE.get(key)
     if (
         isinstance(cached, torch.Tensor)
         and cached.device == device
-        and cached.dtype == torch.int64
-        and tuple(cached.shape) == tuple(grid_sizes.shape)
+        and (cached.dtype == torch.int64)
+        and (tuple(cached.shape) == tuple(grid_sizes.shape))
     ):
         ready = _LF_GRID_DEVICE_READY.get(key)
         if ready is not None and torch.cuda.is_available():
@@ -59,15 +43,14 @@ def _lf_grid_sizes_on_device(
                 current_stream.wait_event(ready[0])
         return cached
     source = grid_sizes
-    # Pin the first geometry transfer as well.
     if torch.cuda.is_available():
         cpu_key = (shape, values)
         cached_cpu = _LF_GRID_CPU_CACHE.get(cpu_key)
         if (
             isinstance(cached_cpu, torch.Tensor)
             and cached_cpu.device.type == "cpu"
-            and cached_cpu.dtype == torch.int64
-            and tuple(cached_cpu.shape) == shape
+            and (cached_cpu.dtype == torch.int64)
+            and (tuple(cached_cpu.shape) == shape)
         ):
             source = cached_cpu
         else:
@@ -88,21 +71,23 @@ def _lf_grid_sizes_on_device(
     return uploaded
 
 
-def _rope_reference(x: torch.Tensor, grid_sizes: torch.Tensor, freqs: torch.Tensor, start_frame: int = 0):
-    """Reference implementation matching Wan's causal rotary layout."""
-    n, c = x.size(2), x.size(3) // 2
+def _rope_reference(
+    x: torch.Tensor, grid_sizes: torch.Tensor, freqs: torch.Tensor, start_frame: int = 0
+):
+    n, c = (x.size(2), x.size(3) // 2)
     split_freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
     output = []
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
         seq_len = int(f * h * w)
-        x_i = torch.view_as_complex(
-            x[i, :seq_len].to(torch.float64).reshape(seq_len, n, -1, 2)
-        )
-        freqs_i = torch.cat([
-            split_freqs[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            split_freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            split_freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
-        ], dim=-1).reshape(seq_len, 1, -1)
+        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(seq_len, n, -1, 2))
+        freqs_i = torch.cat(
+            [
+                split_freqs[0][start_frame : start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                split_freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                split_freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
+            ],
+            dim=-1,
+        ).reshape(seq_len, 1, -1)
         x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
         output.append(torch.cat([x_i, x[i, seq_len:]], dim=0))
     return torch.stack(output).type_as(x)
@@ -112,12 +97,20 @@ if triton is not None:
 
     @triton.jit
     def _causal_rope_apply_kernel(
-        OUT, X, FREQS_REAL, GRID,
-        NUM_HEADS: tl.constexpr, HEAD_DIM: tl.constexpr,
-        SEQ_STRIDE: tl.constexpr, T_DIM: tl.constexpr,
-        H_DIM: tl.constexpr, START_FRAME: tl.constexpr,
-        CONJUGATE: tl.constexpr, BLOCK_SIZE: tl.constexpr,
-        HEAD_MAJOR: tl.constexpr = False, SELECTED_FRAMES: tl.constexpr = 0,
+        OUT,
+        X,
+        FREQS_REAL,
+        GRID,
+        NUM_HEADS: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
+        SEQ_STRIDE: tl.constexpr,
+        T_DIM: tl.constexpr,
+        H_DIM: tl.constexpr,
+        START_FRAME: tl.constexpr,
+        CONJUGATE: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+        HEAD_MAJOR: tl.constexpr = False,
+        SELECTED_FRAMES: tl.constexpr = 0,
     ):
         row_idx = tl.program_id(0)
         batch_idx = row_idx // (SEQ_STRIDE * NUM_HEADS)
@@ -144,9 +137,7 @@ if triton is not None:
         y = rem // w
         z = rem - y * w
         freq_row = tl.where(
-            col_offsets < T_DIM,
-            START_FRAME + t,
-            tl.where(col_offsets < T_DIM + H_DIM, y, z),
+            col_offsets < T_DIM, START_FRAME + t, tl.where(col_offsets < T_DIM + H_DIM, y, z)
         )
         freq_offset = (freq_row * half_head_dim + col_offsets) * 2
         load_mask = mask & is_valid
@@ -165,7 +156,6 @@ if triton is not None:
 def compacted_rope_apply(
     x: torch.Tensor, grid_sizes: torch.Tensor, freqs: torch.Tensor, start_frame: int = 0
 ) -> torch.Tensor:
-    """LightForcing's inference RoPE kernel, with a reference fallback."""
     if triton is None or not x.is_cuda or x.shape[-1] % 2:
         return _rope_reference(x, grid_sizes, freqs, start_frame=start_frame)
     b, seq_len, heads, head_dim = x.shape
@@ -177,10 +167,21 @@ def compacted_rope_apply(
     grid = _lf_grid_sizes_on_device(grid_sizes, x.device)
     freqs_real = torch.view_as_real(freqs.to(device=x.device))
     block_size = triton.next_power_of_2(c)
-    _causal_rope_apply_kernel[(b * seq_len * heads,)](
-        out, x_contig, freqs_real, grid, heads, head_dim, seq_len,
-        t_dim, h_dim, int(start_frame), False, BLOCK_SIZE=block_size,
-        num_warps=1, num_stages=2,
+    _causal_rope_apply_kernel[b * seq_len * heads,](
+        out,
+        x_contig,
+        freqs_real,
+        grid,
+        heads,
+        head_dim,
+        seq_len,
+        t_dim,
+        h_dim,
+        int(start_frame),
+        False,
+        BLOCK_SIZE=block_size,
+        num_warps=1,
+        num_stages=2,
     )
     return out.type_as(x)
 
@@ -196,7 +197,6 @@ def _rope_apply_packed_rows_reference(
     start_frame: int,
     inplace: bool,
 ) -> torch.Tensor:
-    """Reference RoPE for hit/miss rows using ordinals in the full selected window."""
     if x.ndim == 4:
         rows, max_tokens, heads, head_dim = (int(v) for v in x.shape)
         packed = False
@@ -218,8 +218,6 @@ def _rope_apply_packed_rows_reference(
         raise ValueError("row_lens shape does not match compact rows")
     if int(grid_sizes.ndim) != 2 or int(grid_sizes.shape[1]) < 3:
         raise ValueError("grid_sizes must have shape [B,3]")
-
-    # All rows share the spatial grid.
     height = int(grid_sizes[0, 1].item())
     width = int(grid_sizes[0, 2].item())
     if height <= 0 or width <= 0:
@@ -302,34 +300,32 @@ if triton is not None:
             token_offset = tl.load(CU_SEQLENS + row).to(tl.int64) + token
         else:
             token_offset = row * MAX_TOKENS + token
-
         half_dim: tl.constexpr = HEAD_DIM // 2
         col_offsets = tl.arange(0, BLOCK_SIZE)
         col_mask = col_offsets < half_dim
         x_ptr = X + token_offset * HEAD_DIM
         out_ptr = OUT + token_offset * HEAD_DIM
-        # Skip invalid packed rows; padded rows retain their original values.
         if PACKED:
             data_mask = col_mask & valid
         else:
             data_mask = col_mask
         x_real = tl.load(x_ptr + col_offsets * 2, mask=data_mask, other=0.0)
         x_imag = tl.load(x_ptr + col_offsets * 2 + 1, mask=data_mask, other=0.0)
-
         frame_idx = token // FRAME_SEQLEN
-        frame_pos = tl.load(
-            FRAME_POSITIONS + row * MAX_FRAMES + frame_idx,
-            mask=valid & (frame_idx < MAX_FRAMES),
-            other=0,
-        ).to(tl.int64) + START_FRAME
+        frame_pos = (
+            tl.load(
+                FRAME_POSITIONS + row * MAX_FRAMES + frame_idx,
+                mask=valid & (frame_idx < MAX_FRAMES),
+                other=0,
+            ).to(tl.int64)
+            + START_FRAME
+        )
         in_frame = token - frame_idx * FRAME_SEQLEN
         width = tl.load(GRID + 2).to(tl.int32)
         y = in_frame // width
         z = in_frame - y * width
         freq_row = tl.where(
-            col_offsets < T_DIM,
-            frame_pos,
-            tl.where(col_offsets < T_DIM + H_DIM, y, z),
+            col_offsets < T_DIM, frame_pos, tl.where(col_offsets < T_DIM + H_DIM, y, z)
         )
         freq_offset = (freq_row * half_dim + col_offsets) * 2
         load_mask = col_mask & valid
@@ -339,16 +335,8 @@ if triton is not None:
         xi = x_imag.to(tl.float32)
         rr = xr * cos_vals.to(tl.float32) - xi * sin_vals.to(tl.float32)
         ri = xr * sin_vals.to(tl.float32) + xi * cos_vals.to(tl.float32)
-        tl.store(
-            out_ptr + col_offsets * 2,
-            tl.where(valid, rr, xr),
-            mask=data_mask,
-        )
-        tl.store(
-            out_ptr + col_offsets * 2 + 1,
-            tl.where(valid, ri, xi),
-            mask=data_mask,
-        )
+        tl.store(out_ptr + col_offsets * 2, tl.where(valid, rr, xr), mask=data_mask)
+        tl.store(out_ptr + col_offsets * 2 + 1, tl.where(valid, ri, xi), mask=data_mask)
 
 
 def compacted_rope_apply_packed_rows(
@@ -363,9 +351,6 @@ def compacted_rope_apply_packed_rows(
     start_frame: int = 0,
     inplace: bool = False,
 ) -> torch.Tensor | None:
-    """Apply RoPE using full-window ordinals, preserving padded or packed layout.
-
-    The input stays raw unless inplace=True; miss KV must stay raw until slot fill."""
     if not isinstance(x, torch.Tensor) or x.ndim not in (3, 4):
         return None
     if not isinstance(frame_positions, torch.Tensor) or frame_positions.ndim != 2:
@@ -387,8 +372,6 @@ def compacted_rope_apply_packed_rows(
         return None
     if int(frame_seqlen) <= 0:
         return None
-
-    # Pin CPU row-plan metadata before asynchronous H2D.
     if frame_positions.device.type == "cpu" and torch.cuda.is_available():
         try:
             if not frame_positions.is_pinned():
@@ -396,27 +379,16 @@ def compacted_rope_apply_packed_rows(
         except Exception:
             pass
     frame_positions = frame_positions.to(
-        device=x.device,
-        dtype=torch.long,
-        non_blocking=True,
+        device=x.device, dtype=torch.long, non_blocking=True
     ).contiguous()
     row_lens = row_lens.to(device=x.device, dtype=torch.int32).contiguous()
     if cu_seqlens is not None:
         cu_seqlens = cu_seqlens.to(device=x.device, dtype=torch.int32).contiguous()
-
-    # Launch by plan width; ROW_LENS masks padding without device-side reductions.
     max_frames = int(frame_positions.shape[1])
-    max_tokens = (
-        int(x.shape[1])
-        if x.ndim == 4
-        else max(1, max_frames * int(frame_seqlen))
-    )
+    max_tokens = int(x.shape[1]) if x.ndim == 4 else max(1, max_frames * int(frame_seqlen))
     if max_frames <= 0 or max_tokens <= 0:
         return None
-
-    # Hits may be rotated in place; misses stay raw until asynchronous slot fill.
     inplace = bool(inplace and x.is_contiguous())
-
     if triton is None or not x.is_cuda:
         return _rope_apply_packed_rows_reference(
             x,
@@ -429,7 +401,6 @@ def compacted_rope_apply_packed_rows(
             int(start_frame),
             inplace,
         )
-
     head_dim = int(x.shape[-1])
     half_dim = head_dim // 2
     t_dim = half_dim - 2 * (half_dim // 3)
@@ -438,7 +409,7 @@ def compacted_rope_apply_packed_rows(
     grid = _lf_grid_sizes_on_device(grid_sizes, x.device)
     freqs_real = torch.view_as_real(freqs.to(device=x.device)).contiguous()
     out = x if inplace else torch.empty_like(x)
-    _packed_rows_rope_apply_kernel[(rows * max_tokens,)](
+    _packed_rows_rope_apply_kernel[rows * max_tokens,](
         out,
         x.contiguous(),
         frame_positions,
@@ -471,13 +442,18 @@ def compacted_rope_apply_compact(
     freqs: torch.Tensor,
     start_frame: int = 0,
 ) -> torch.Tensor | None:
-    """Apply RoPE to uniform [B*H,T,1,D] rows, anchored at start_frame."""
     if (
-        triton is None or not x.is_cuda or not x.is_contiguous()
-        or x.ndim != 4 or int(x.shape[2]) != 1 or int(x.shape[-1]) % 2
-        or int(num_heads) <= 0 or int(x.shape[0]) % int(num_heads)
-        or int(selected_frames) <= 0 or int(frame_seqlen) <= 0
-        or int(x.shape[1]) != int(selected_frames) * int(frame_seqlen)
+        triton is None
+        or not x.is_cuda
+        or (not x.is_contiguous())
+        or (x.ndim != 4)
+        or (int(x.shape[2]) != 1)
+        or int(x.shape[-1]) % 2
+        or (int(num_heads) <= 0)
+        or int(x.shape[0]) % int(num_heads)
+        or (int(selected_frames) <= 0)
+        or (int(frame_seqlen) <= 0)
+        or (int(x.shape[1]) != int(selected_frames) * int(frame_seqlen))
     ):
         return None
     rows, tokens, _, head_dim = x.shape
@@ -485,9 +461,18 @@ def compacted_rope_apply_compact(
     grid = _lf_grid_sizes_on_device(grid_sizes, x.device)
     freqs_real = torch.view_as_real(freqs.to(device=x.device)).contiguous()
     out = torch.empty_like(x)
-    _causal_rope_apply_kernel[(rows * tokens,)](
-        out, x, freqs_real, grid, int(num_heads), head_dim, tokens,
-        half_dim - 2 * (half_dim // 3), half_dim // 3, int(start_frame), False,
+    _causal_rope_apply_kernel[rows * tokens,](
+        out,
+        x,
+        freqs_real,
+        grid,
+        int(num_heads),
+        head_dim,
+        tokens,
+        half_dim - 2 * (half_dim // 3),
+        half_dim // 3,
+        int(start_frame),
+        False,
         BLOCK_SIZE=triton.next_power_of_2(half_dim),
         HEAD_MAJOR=True,
         SELECTED_FRAMES=int(selected_frames),

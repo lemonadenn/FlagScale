@@ -138,10 +138,6 @@ void ensure_current_cuda_context_for_driver_batch(int device, const char* label)
   initialized_device = device;
 }
 
-bool cpu_kv_is_head_major(const torch::Tensor& cpu_k, int64_t num_heads) {
-  return cpu_k.dim() == 4 && cpu_k.size(1) == num_heads && cpu_k.size(2) != num_heads;
-}
-
 int64_t infer_gpu_slot_head_count(
     const torch::Tensor& gpu_k,
     int64_t frame_seqlen,
@@ -153,7 +149,6 @@ int64_t infer_gpu_slot_head_count(
   TORCH_CHECK(gpu_k.size(1) % tokens_per_head == 0, "gpu KV slot token dimension mismatch");
   return gpu_k.size(1) / tokens_per_head;
 }
-
 
 template <typename scalar_t>
 __global__ void kv_sparse_frame_materialize_kernel(
@@ -235,7 +230,6 @@ __global__ void kv_sparse_frame_materialize_kernel(
     v_out[out_offset] = v_value;
   }
 }
-
 
 template <typename scalar_t>
 __global__ void kv_sparse_frame_materialize_varlen_tiled_kernel(
@@ -326,63 +320,6 @@ __global__ void kv_sparse_frame_materialize_varlen_tiled_kernel(
   v_out[out_offset] = v_value;
 }
 
-
-__global__ void kv_sparse_lookup_frame_slots_kernel(
-    const int64_t* __restrict__ head_indices,
-    const int64_t* __restrict__ frame_indices,
-    const int64_t* __restrict__ frame_to_slot,
-    int64_t* __restrict__ slot_indices,
-    int32_t* __restrict__ miss_flag,
-    int64_t head_count,
-    int64_t n_selected,
-    int64_t frame_capacity,
-    int64_t total_tokens,
-    int64_t frame_seqlen,
-    int64_t num_heads,
-    int64_t gpu_cache_frames,
-    int64_t live_start_index,
-    int64_t live_len,
-    bool has_live) {
-  const int64_t total = head_count * n_selected;
-  const int64_t live_end_index = live_start_index + live_len;
-  for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
-       linear < total;
-       linear += static_cast<int64_t>(blockDim.x) * gridDim.x) {
-    const int64_t row = linear / n_selected;
-    const int64_t head_id = head_indices[row];
-    const int64_t frame_id = frame_indices[linear];
-    int64_t slot = -3;
-
-    if (head_id >= 0 && head_id < num_heads && frame_id >= 0) {
-      const int64_t frame_start = frame_id * frame_seqlen;
-      if (frame_start < total_tokens) {
-        const int64_t remaining = total_tokens - frame_start;
-        const int64_t frame_len = frame_seqlen < remaining ? frame_seqlen : remaining;
-        if (frame_len > 0) {
-          const int64_t frame_end = frame_start + frame_len;
-          const bool is_live =
-              has_live && frame_start >= live_start_index && frame_end <= live_end_index;
-          if (is_live) {
-            slot = kLiveSlot;
-          } else if (frame_id < frame_capacity) {
-            const int64_t looked_up = frame_to_slot[head_id * frame_capacity + frame_id];
-            if (looked_up >= 0 && looked_up < gpu_cache_frames) {
-              slot = looked_up;
-            } else {
-              atomicExch(miss_flag, 1);
-            }
-          } else {
-            atomicExch(miss_flag, 1);
-          }
-        }
-      }
-    }
-
-    slot_indices[linear] = slot;
-  }
-}
-
-
 __global__ void kv_sparse_update_frame_slot_map_kernel(
     int64_t* __restrict__ frame_to_slot,
     const int64_t* __restrict__ head_ids,
@@ -410,7 +347,6 @@ __global__ void kv_sparse_update_frame_slot_map_kernel(
     }
   }
 }
-
 
 template <typename scalar_t>
 __global__ void pooled_qk_q_mean_kernel(
@@ -653,13 +589,12 @@ int64_t copy_frame_to_slot_unchecked(
     cudaStream_t stream) {
   const int64_t B = cpu_k.size(0);
   const int64_t H = infer_gpu_slot_head_count(gpu_k, frame_seqlen, gpu_cache_frames);
-  const bool head_major = cpu_kv_is_head_major(cpu_k, H);
-  const int64_t T = head_major ? cpu_k.size(2) : cpu_k.size(1);
+  const int64_t T = cpu_k.size(2);
   const int64_t D = cpu_k.size(3);
 
   check_tensor(cpu_k.size(0) == gpu_k.size(0) && cpu_k.size(3) == gpu_k.size(3),
                "cpu/gpu KV shape mismatch");
-  check_tensor((head_major ? cpu_k.size(1) : cpu_k.size(2)) == H,
+  check_tensor((cpu_k.size(1)) == H,
                "cpu KV head dimension mismatch");
   check_tensor(head_id >= 0 && head_id < H, "head_id out of range");
   check_tensor(frame_id >= 0, "frame_id must be non-negative");
@@ -676,16 +611,10 @@ int64_t copy_frame_to_slot_unchecked(
 
   const size_t elem_size = static_cast<size_t>(cpu_k.element_size());
   const size_t width_bytes = static_cast<size_t>(D) * elem_size;
-  const size_t src_pitch = head_major
-      ? static_cast<size_t>(copy_tokens * D) * elem_size
-      : static_cast<size_t>(H * D) * elem_size;
-  const size_t dst_pitch = head_major
-      ? static_cast<size_t>(copy_tokens * D) * elem_size
-      : static_cast<size_t>(D) * elem_size;
-  const size_t copy_width = head_major
-      ? static_cast<size_t>(copy_tokens * D) * elem_size
-      : width_bytes;
-  const size_t copy_height = head_major ? 1 : static_cast<size_t>(copy_tokens);
+  const size_t src_pitch = static_cast<size_t>(copy_tokens * D) * elem_size;
+  const size_t dst_pitch = static_cast<size_t>(copy_tokens * D) * elem_size;
+  const size_t copy_width = static_cast<size_t>(copy_tokens * D) * elem_size;
+  const size_t copy_height = 1;
   const int64_t gpu_cache_tokens = gpu_k.size(1);
   const int64_t slot_start = (head_id * gpu_cache_frames + slot) * frame_seqlen;
 
@@ -694,9 +623,7 @@ int64_t copy_frame_to_slot_unchecked(
   char* gpu_k_ptr = static_cast<char*>(gpu_k.data_ptr());
   char* gpu_v_ptr = static_cast<char*>(gpu_v.data_ptr());
   for (int64_t b = 0; b < B; ++b) {
-    const int64_t src_elem = head_major
-        ? (b * H * T + head_id * T + start) * D
-        : ((b * T + start) * H + head_id) * D;
+    const int64_t src_elem = (b * H * T + head_id * T + start) * D;
     const int64_t dst_elem = (b * gpu_cache_tokens + slot_start) * D;
     const char* src_k = cpu_k_ptr + src_elem * static_cast<int64_t>(elem_size);
     const char* src_v = cpu_v_ptr + src_elem * static_cast<int64_t>(elem_size);
@@ -740,13 +667,12 @@ int64_t copy_frame_run_to_slots_unchecked(
     cudaStream_t stream) {
   const int64_t B = cpu_k.size(0);
   const int64_t H = infer_gpu_slot_head_count(gpu_k, frame_seqlen, gpu_cache_frames);
-  const bool head_major = cpu_kv_is_head_major(cpu_k, H);
-  const int64_t T = head_major ? cpu_k.size(2) : cpu_k.size(1);
+  const int64_t T = cpu_k.size(2);
   const int64_t D = cpu_k.size(3);
 
   check_tensor(cpu_k.size(0) == gpu_k.size(0) && cpu_k.size(3) == gpu_k.size(3),
                "cpu/gpu KV shape mismatch");
-  check_tensor((head_major ? cpu_k.size(1) : cpu_k.size(2)) == H,
+  check_tensor((cpu_k.size(1)) == H,
                "cpu KV head dimension mismatch");
   check_tensor(head_id >= 0 && head_id < H, "head_id out of range");
   check_tensor(start_frame_id >= 0, "start_frame_id must be non-negative");
@@ -778,16 +704,10 @@ int64_t copy_frame_run_to_slots_unchecked(
 
   const size_t elem_size = static_cast<size_t>(cpu_k.element_size());
   const size_t width_bytes = static_cast<size_t>(D) * elem_size;
-  const size_t src_pitch = head_major
-      ? static_cast<size_t>(total_copy_tokens * D) * elem_size
-      : static_cast<size_t>(H * D) * elem_size;
-  const size_t dst_pitch = head_major
-      ? static_cast<size_t>(total_copy_tokens * D) * elem_size
-      : static_cast<size_t>(D) * elem_size;
-  const size_t copy_width = head_major
-      ? static_cast<size_t>(total_copy_tokens * D) * elem_size
-      : width_bytes;
-  const size_t copy_height = head_major ? 1 : static_cast<size_t>(total_copy_tokens);
+  const size_t src_pitch = static_cast<size_t>(total_copy_tokens * D) * elem_size;
+  const size_t dst_pitch = static_cast<size_t>(total_copy_tokens * D) * elem_size;
+  const size_t copy_width = static_cast<size_t>(total_copy_tokens * D) * elem_size;
+  const size_t copy_height = 1;
   const int64_t gpu_cache_tokens = gpu_k.size(1);
   const int64_t slot_start = (head_id * gpu_cache_frames + start_slot) * frame_seqlen;
 
@@ -796,9 +716,7 @@ int64_t copy_frame_run_to_slots_unchecked(
   char* gpu_k_ptr = static_cast<char*>(gpu_k.data_ptr());
   char* gpu_v_ptr = static_cast<char*>(gpu_v.data_ptr());
   for (int64_t b = 0; b < B; ++b) {
-    const int64_t src_elem = head_major
-        ? (b * H * T + head_id * T + start) * D
-        : ((b * T + start) * H + head_id) * D;
+    const int64_t src_elem = (b * H * T + head_id * T + start) * D;
     const int64_t dst_elem = (b * gpu_cache_tokens + slot_start) * D;
     const char* src_k = cpu_k_ptr + src_elem * static_cast<int64_t>(elem_size);
     const char* src_v = cpu_v_ptr + src_elem * static_cast<int64_t>(elem_size);
@@ -827,7 +745,6 @@ int64_t copy_frame_run_to_slots_unchecked(
   }
   return capped_run_frames;
 }
-
 
 }  // namespace
 
@@ -1039,70 +956,6 @@ void kv_sparse_frame_materialize_varlen_cuda(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-
-std::vector<torch::Tensor> kv_sparse_lookup_frame_slots_cuda(
-    torch::Tensor head_indices,
-    torch::Tensor frame_indices,
-    torch::Tensor frame_to_slot,
-    int64_t total_tokens,
-    int64_t frame_seqlen,
-    int64_t num_heads,
-    int64_t gpu_cache_frames,
-    int64_t live_start_index,
-    int64_t live_len,
-    bool has_live) {
-  check_tensor(head_indices.is_cuda() && frame_indices.is_cuda() && frame_to_slot.is_cuda(),
-               "lookup tensors must be CUDA tensors");
-  check_tensor(head_indices.is_contiguous() && frame_indices.is_contiguous() &&
-                   frame_to_slot.is_contiguous(),
-               "lookup tensors must be contiguous");
-  check_tensor(head_indices.scalar_type() == at::kLong, "head_indices must be int64");
-  check_tensor(frame_indices.scalar_type() == at::kLong, "frame_indices must be int64");
-  check_tensor(frame_to_slot.scalar_type() == at::kLong, "frame_to_slot must be int64");
-  check_tensor(head_indices.dim() == 1, "head_indices must be 1D");
-  check_tensor(frame_indices.dim() == 2, "frame_indices must be 2D");
-  check_tensor(frame_to_slot.dim() == 2, "frame_to_slot must be 2D");
-  check_tensor(frame_indices.size(0) == head_indices.size(0), "lookup shape mismatch");
-  check_tensor(frame_to_slot.size(0) >= num_heads, "frame_to_slot head dimension too small");
-  check_tensor(frame_seqlen > 0, "frame_seqlen must be positive");
-  check_tensor(num_heads > 0 && gpu_cache_frames > 0, "head/cache sizes must be positive");
-  check_tensor(frame_to_slot.device() == frame_indices.device(), "lookup device mismatch");
-  check_tensor(head_indices.device() == frame_indices.device(), "lookup device mismatch");
-
-  const int64_t head_count = head_indices.size(0);
-  const int64_t n_selected = frame_indices.size(1);
-  auto slot_indices = torch::full_like(frame_indices, static_cast<int64_t>(-3));
-  auto miss_flag = torch::zeros({1}, torch::TensorOptions().dtype(torch::kInt32).device(frame_indices.device()));
-  if (head_count <= 0 || n_selected <= 0 || total_tokens <= 0) {
-    return {slot_indices, miss_flag};
-  }
-
-  const c10::cuda::CUDAGuard device_guard(frame_indices.device());
-  const int threads = 256;
-  const int64_t total = head_count * n_selected;
-  const int blocks = static_cast<int>(std::min<int64_t>((total + threads - 1) / threads, 65535));
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  kv_sparse_lookup_frame_slots_kernel<<<blocks, threads, 0, stream>>>(
-      head_indices.data_ptr<int64_t>(),
-      frame_indices.data_ptr<int64_t>(),
-      frame_to_slot.data_ptr<int64_t>(),
-      slot_indices.data_ptr<int64_t>(),
-      miss_flag.data_ptr<int32_t>(),
-      head_count,
-      n_selected,
-      frame_to_slot.size(1),
-      total_tokens,
-      frame_seqlen,
-      num_heads,
-      gpu_cache_frames,
-      live_start_index,
-      live_len,
-      has_live);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return {slot_indices, miss_flag};
-}
-
-
 void kv_sparse_update_frame_slot_map_cuda(
     torch::Tensor frame_to_slot,
     torch::Tensor head_ids,
@@ -1151,7 +1004,6 @@ void kv_sparse_update_frame_slot_map_cuda(
       frame_to_slot.size(1));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
-
 
 torch::Tensor kv_sparse_select_pooled_qk_topk_cuda(
     torch::Tensor q,
@@ -1257,7 +1109,6 @@ torch::Tensor kv_sparse_select_pooled_qk_topk_cuda(
   return out;
 }
 
-
 int64_t kv_sparse_copy_frame_plan_to_slots_cuda(
     torch::Tensor cpu_k,
     torch::Tensor cpu_v,
@@ -1291,13 +1142,12 @@ int64_t kv_sparse_copy_frame_plan_to_slots_cuda(
 
   const int64_t B = cpu_k.size(0);
   const int64_t H = infer_gpu_slot_head_count(gpu_k, frame_seqlen, gpu_cache_frames);
-  const bool head_major = cpu_kv_is_head_major(cpu_k, H);
-  const int64_t T = head_major ? cpu_k.size(2) : cpu_k.size(1);
+  const int64_t T = cpu_k.size(2);
   const int64_t D = cpu_k.size(3);
   (void)B;
   check_tensor(gpu_k.size(0) == B && gpu_k.size(2) == 1 && gpu_k.size(3) == D,
                "gpu KV shape mismatch");
-  check_tensor((head_major ? cpu_k.size(1) : cpu_k.size(2)) == H,
+  check_tensor((cpu_k.size(1)) == H,
                "cpu KV head dimension mismatch");
   check_tensor(frame_indices.size(0) == H, "copy plan head dimension mismatch");
   check_tensor(frame_seqlen > 0 && gpu_cache_frames > 0, "frame/cache sizes must be positive");
@@ -1422,12 +1272,11 @@ int64_t kv_sparse_copy_frame_plan_to_slots_batched_cuda(
 
   const int64_t B = cpu_k.size(0);
   const int64_t H = frame_indices.size(0);
-  const bool head_major = cpu_kv_is_head_major(cpu_k, H);
-  const int64_t T = head_major ? cpu_k.size(2) : cpu_k.size(1);
+  const int64_t T = cpu_k.size(2);
   const int64_t D = cpu_k.size(3);
   check_tensor(gpu_k.size(0) == B && gpu_k.size(2) == 1 && gpu_k.size(3) == D,
                "gpu KV shape mismatch");
-  check_tensor((head_major ? cpu_k.size(1) : cpu_k.size(2)) == H, "copy plan head dimension mismatch");
+  check_tensor((cpu_k.size(1)) == H, "copy plan head dimension mismatch");
   check_tensor(frame_seqlen > 0 && gpu_cache_frames > 0, "frame/cache sizes must be positive");
 
   const int64_t n_selected = frame_indices.size(1);
@@ -1482,17 +1331,13 @@ int64_t kv_sparse_copy_frame_plan_to_slots_batched_cuda(
         continue;
       }
       for (int64_t b = 0; b < B; ++b) {
-        const int64_t src_elem = head_major
-            ? b * src_batch_stride + head_id * T * D + start * D
-            : b * src_batch_stride + start * H * D + head_id * D;
+        const int64_t src_elem = b * src_batch_stride + head_id * T * D + start * D;
         const int64_t dst_token = (head_id * gpu_cache_frames + slot) * frame_seqlen;
         const int64_t dst_elem = (b * gpu_cache_tokens + dst_token) * D;
-        const size_t copy_width = head_major
-            ? static_cast<size_t>(copy_tokens * D) * elem_size
-            : width_bytes;
-        const size_t copy_height = head_major ? 1 : static_cast<size_t>(copy_tokens);
-        const size_t copy_src_pitch = head_major ? copy_width : src_pitch;
-        const size_t copy_dst_pitch = head_major ? copy_width : dst_pitch;
+        const size_t copy_width = static_cast<size_t>(copy_tokens * D) * elem_size;
+        const size_t copy_height = 1;
+        const size_t copy_src_pitch = copy_width;
+        const size_t copy_dst_pitch = copy_width;
         append_batch_2d_copy(
             ops,
             cpu_k_ptr + src_elem * static_cast<int64_t>(elem_size),
@@ -1566,7 +1411,6 @@ int64_t kv_sparse_copy_frame_plan_to_slots_batched_cuda(
   return copied;
 }
 
-
 int64_t kv_sparse_copy_frames_to_compact_cuda(
     torch::Tensor cpu_k,
     torch::Tensor cpu_v,
@@ -1601,8 +1445,8 @@ int64_t kv_sparse_copy_frames_to_compact_cuda(
   check_tensor(frame_seqlen > 0, "frame_seqlen must be positive");
 
   const int64_t B = cpu_k.size(0);
-  const int64_t H = cpu_head_major ? cpu_k.size(1) : cpu_k.size(2);
-  const int64_t T = cpu_head_major ? cpu_k.size(2) : cpu_k.size(1);
+  const int64_t H = cpu_k.size(1);
+  const int64_t T = cpu_k.size(2);
   const int64_t D = cpu_k.size(3);
   const int64_t rows = head_ids.size(0);
   const int64_t max_selected = frame_ids.size(1);
@@ -1685,16 +1529,12 @@ int64_t kv_sparse_copy_frames_to_compact_cuda(
         check_tensor(dst_token_start >= cu_ptr[packed_row] &&
                          dst_token_start + total_copy_tokens <= cu_ptr[packed_row + 1],
                      "compact destination span out of range");
-        const int64_t src_elem = cpu_head_major
-            ? b * src_batch_stride + head_id * T * D + start * D
-            : b * src_batch_stride + start * H * D + head_id * D;
+        const int64_t src_elem = b * src_batch_stride + head_id * T * D + start * D;
         const int64_t dst_elem = dst_token_start * D;
-        const size_t copy_width = cpu_head_major
-            ? static_cast<size_t>(total_copy_tokens * D) * elem_size
-            : width_bytes;
-        const size_t copy_height = cpu_head_major ? 1 : static_cast<size_t>(total_copy_tokens);
-        const size_t copy_src_pitch = cpu_head_major ? copy_width : token_major_src_pitch;
-        const size_t copy_dst_pitch = cpu_head_major ? copy_width : dst_pitch;
+        const size_t copy_width = static_cast<size_t>(total_copy_tokens * D) * elem_size;
+        const size_t copy_height = 1;
+        const size_t copy_src_pitch = copy_width;
+        const size_t copy_dst_pitch = copy_width;
         if (use_batch) {
           append_batch_2d_copy(
               ops,
@@ -1768,7 +1608,6 @@ int64_t kv_sparse_copy_frames_to_compact_cuda(
   return copied;
 }
 
-
 int64_t kv_sparse_copy_kv_span_to_cpu_cuda(
     torch::Tensor gpu_k_span,
     torch::Tensor gpu_v_span,
@@ -1791,9 +1630,8 @@ int64_t kv_sparse_copy_kv_span_to_cpu_cuda(
   const int64_t span_tokens = gpu_k_span.size(1);
   const int64_t H = gpu_k_span.size(2);
   const int64_t D = gpu_k_span.size(3);
-  const bool head_major = cpu_kv_is_head_major(cpu_k, H);
-  const int64_t cpu_tokens = head_major ? cpu_k.size(2) : cpu_k.size(1);
-  check_tensor(cpu_k.size(0) == B && (head_major ? cpu_k.size(1) : cpu_k.size(2)) == H && cpu_k.size(3) == D,
+  const int64_t cpu_tokens = cpu_k.size(2);
+  check_tensor(cpu_k.size(0) == B && (cpu_k.size(1)) == H && cpu_k.size(3) == D,
                "cpu KV shape mismatch");
   check_tensor(start_token >= 0, "start_token must be non-negative");
   check_tensor(start_token + span_tokens <= cpu_tokens, "destination token span out of range");
@@ -1811,14 +1649,11 @@ int64_t kv_sparse_copy_kv_span_to_cpu_cuda(
   const char* gpu_v_ptr = static_cast<const char*>(gpu_v_span.data_ptr());
   char* cpu_k_ptr = static_cast<char*>(cpu_k.data_ptr());
   char* cpu_v_ptr = static_cast<char*>(cpu_v.data_ptr());
-  if (!head_major) {
-    cpu_k_ptr += dst_token_offset_elems * static_cast<int64_t>(elem_size);
-    cpu_v_ptr += dst_token_offset_elems * static_cast<int64_t>(elem_size);
-  }
+
 
   const c10::cuda::CUDAGuard device_guard(gpu_k_span.device());
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  if (head_major) {
+
     KvMemcpy3DBatchAsyncFn batch_fn = resolve_memcpy_3d_batch_async();
     if (batch_fn == nullptr || stream == nullptr) {
       return 0;
@@ -1863,7 +1698,7 @@ int64_t kv_sparse_copy_kv_span_to_cpu_cuda(
     CUresult result = batch_fn(
         ops.size(), ops.data(), &fail_idx, 0, reinterpret_cast<CUstream>(stream));
     return result == CUDA_SUCCESS ? span_tokens : 0;
-  }
+
   cudaError_t err = cudaMemcpy2DAsync(
       cpu_k_ptr,
       dst_pitch,

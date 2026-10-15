@@ -1,7 +1,6 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 """FlagScale-owned HorizonKV configuration and scoped native execution state."""
-
 import importlib.metadata
 import json
 import math
@@ -12,12 +11,8 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 
-# Upstream uses process-global environment variables and RASA counters. Serialize
-# native calls, including cleanup, until it exposes an instance-local runtime.
 _NATIVE_LOCK = threading.RLock()
 _ENV_PREFIXES = ("HORIZONKV_", "KV_SPARSE_", "SELF_FORCING_", "TIME_BREAKDOWN_")
-
-
 PACKAGE_ROOT = Path(__file__).resolve().parent
 
 
@@ -32,10 +27,7 @@ def check_environment(require_cuda=False):
     }
     if sys.version_info[:2] != (3, 10) or torch.__version__.split("+")[0] != "2.5.1":
         raise RuntimeError(
-            "HorizonKV currently requires a Python 3.10 / PyTorch 2.5.1 worker. "
-            f"Found Python {report['python']} / torch {report['torch']}. "
-            "Use examples/horizonkv/setup_env.sh and experiment.cmds.before_start; "
-            "do not install its CUDA extensions into the default FlagScale environment."
+            f"HorizonKV currently requires a Python 3.10 / PyTorch 2.5.1 worker. Found Python {report['python']} / torch {report['torch']}. Use examples/horizonkv/setup_env.sh and experiment.cmds.before_start; do not install its CUDA extensions into the default FlagScale environment."
         )
     for name, version in (("triton", "3.1.0"), ("flash-attn", "2.8.3"), ("diffusers", "0.31.0")):
         try:
@@ -101,7 +93,7 @@ class HorizonKVRuntime:
             raise ValueError(
                 "Use HorizonKV for sparse inference or ARDiffusionPipeline for the baseline"
             )
-        if any(type(n) is not int for n in (cache, window, sink, topk, min_frames)):
+        if any((type(n) is not int for n in (cache, window, sink, topk, min_frames))):
             raise ValueError("cache, window, sink, topk and min_frames must be integers")
         if not 0 <= sparsity < 1 or not math.isfinite(sparsity):
             raise ValueError("sparsity must be finite and in [0, 1)")
@@ -136,46 +128,13 @@ class HorizonKVRuntime:
         )
         self._directory = tempfile.TemporaryDirectory(prefix="flagscale-horizonkv-")
         directory = Path(self._directory.name)
-        config_path, policy_path = directory / "kv_config.json", directory / "rasa.json"
+        config_path, policy_path = (directory / "kv_config.json", directory / "rasa.json")
         config_path.write_text(json.dumps(config, indent=2) + "\n")
         policy_path.write_text(json.dumps(policy, indent=2) + "\n")
         values = dict(
-            CPP_PLAN=1,
-            CPU_OFFLOAD=1,
-            GPU_CACHE_FRAMES=cache,
-            CPU_CACHE_HEAD_MAJOR=1,
-            DEFER_CLEAN_D2H=1,
-            GPU_CACHE_ROLLING=0,
-            CLEAN_GPU_LRU_INSERT=1,
-            ROLLING_SERIAL_SPLIT=0,
             OVERLAP_ATTN=int(not no_overlap),
             OVERLAP_FLASH_SPLIT_ATTN=int(not no_overlap),
-            OVERLAP_FLASH_MATERIALIZE=1,
-            OVERLAP_COMPACT_ONLOAD=1,
             OVERLAP_SPLIT_MIN_MISS_ITEMS=threshold,
-            OVERLAP_SPLIT_MIN_MISS_RATIO=0,
-            FUSED_ONLOAD=1,
-            BATCHED_H2D=1,
-            OVERLAP_BLOCK_SPARSITY=sparsity,
-            FLASH_BLOCK_SPARSITY=sparsity,
-            OVERLAP_BLOCK_SPARSE_ATTN=1,
-            ATTN_BLOCK_SIZE=64,
-            MANDATORY_RECENT_KV_FRAMES=4,
-            TRITON_BLOCKSPARSE_ATTN=1,
-            TRITON_BLOCKSPARSE_BACKEND="cuda_flash",
-            REQUIRE_FLASH_BACKEND=1,
-            TRITON_BLOCKSPARSE_FLASH_BLOCKS=0,
-            TRITON_BLOCKSPARSE_BLOCK_M=64,
-            TRITON_BLOCKSPARSE_BLOCK_N=64,
-            BLOCKSPARSE_BACKEND_TRACE=1,
-            TRITON_GLOBAL_BLOCK_SELECTION=0,
-            TRITON_SELECTOR_FP32=0,
-            GLOBAL_VARLEN_BACKEND=1,
-            TRITON_GLOBAL_FIXED_WIDTH=0,
-            TRITON_GLOBAL_DIRECT_ROWMASK=0,
-            LF_ROPE_TRITON=1,
-            LF_ROPE_TRITON_WARPS=8,
-            LF_ROPE_TRITON_STAGES=2,
             ADAPTIVE_CONFIG=str(policy_path) if not fixed else "",
         )
         self.env = {"HORIZONKV_" + key: str(value) for key, value in values.items()}

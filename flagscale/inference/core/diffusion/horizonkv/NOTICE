@@ -9,7 +9,7 @@ is the production HorizonKV entry and baseline.py is the comparison entry.
 Sources and licenses:
 - Wan2.1 (Copyright 2024-2025 The Alibaba Wan Team Authors), Self-Forcing and
   FramePack: upstream Apache-2.0 notices are retained in their adapted files.
-  The Apache-2.0 text is retained in licenses/Apache-2.0.txt.
+  The Apache-2.0 text is provided by the repository root LICENSE.
 - Krea realtime-video: https://github.com/krea-ai/realtime-video
   Revision acf4b7b4e1a3049a0e04782e751d12203334038d; original source hashes
   are recorded in provenance.json. Its CC-BY-NC-SA-4.0 license is retained in
