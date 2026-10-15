@@ -7,19 +7,19 @@ from typing import List, Optional
 import torch
 from torch import nn
 
-from flagscale.inference.core.diffusion.horizonkv.algorithm.scheduler import (
+from flagscale.inference.core.diffusion.horizonkv.wan.scheduler import (
     FlowMatchScheduler,
     SchedulerInterface,
 )
-from flagscale.inference.core.diffusion.horizonkv.wan.modules.causal_model import CausalWanModel
-from flagscale.inference.core.diffusion.horizonkv.wan.modules.model import (
+from flagscale.inference.core.diffusion.horizonkv.wan.causal_model import CausalWanModel
+from flagscale.inference.core.diffusion.horizonkv.wan.model import (
     GanAttentionBlock,
     RegisterTokens,
     WanModel,
 )
-from flagscale.inference.core.diffusion.horizonkv.wan.modules.t5 import umt5_xxl
-from flagscale.inference.core.diffusion.horizonkv.wan.modules.tokenizers import HuggingfaceTokenizer
-from flagscale.inference.core.diffusion.horizonkv.wan.modules.vae import _video_vae
+from flagscale.inference.core.diffusion.horizonkv.wan.t5 import umt5_xxl
+from flagscale.inference.core.diffusion.horizonkv.wan.tokenizers import HuggingfaceTokenizer
+from flagscale.inference.core.diffusion.horizonkv.wan.vae import _video_vae
 
 
 def _project_root() -> Path:
@@ -137,6 +137,8 @@ class WanVAEWrapper(torch.nn.Module):
 
 
 class WanDiffusionWrapper(torch.nn.Module):
+    sparse_kv_updates = True
+
     def __init__(
             self,
             model_name="Wan2.1-T2V-1.3B",
@@ -151,7 +153,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         project_root = _project_root()
         model_path = project_root / "wan_models" / model_name
         print(f"[WanDiffusionWrapper] Loading model from: {model_path}")
-        
+
         if is_causal:
             self.model = CausalWanModel.from_pretrained(
                 str(model_path), local_attn_size=local_attn_size, sink_size=sink_size,
@@ -254,8 +256,10 @@ class WanDiffusionWrapper(torch.nn.Module):
                 crossattn_cache=crossattn_cache,
                 current_start=current_start,
                 cache_start=cache_start,
-                sink_recache_after_switch=sink_recache_after_switch,
-                kv_cache_update=kv_cache_update,
+                **(dict(
+                    sink_recache_after_switch=sink_recache_after_switch,
+                    kv_cache_update=kv_cache_update,
+                ) if self.sparse_kv_updates else {}),
             ).permute(0, 2, 1, 3, 4)
         else:
             if clean_x is not None:
@@ -319,3 +323,8 @@ class WanDiffusionWrapper(torch.nn.Module):
         We can gradually add more methods here if needed.
         """
         self.get_scheduler()
+
+
+class DenseWanDiffusionWrapper(WanDiffusionWrapper):
+    """Krea's dense cache interface over the common prediction/scheduler code."""
+    sparse_kv_updates = False

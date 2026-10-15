@@ -50,7 +50,7 @@ def check_environment(require_cuda=False):
             report[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError as exc:
             raise RuntimeError(
-                f"Missing model-loading dependency: {name}; install requirements-worker.txt"
+                f"Missing model-loading dependency: {name}; run examples/horizonkv/setup_env.sh"
             ) from exc
     if require_cuda:
         if not torch.cuda.is_available():

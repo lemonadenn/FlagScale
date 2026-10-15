@@ -5,46 +5,21 @@
 Import only inside an activated runtime after checking the native CUDA ABI.
 """
 
-from accelerate import init_empty_weights
-from safetensors import safe_open
 from torch import nn
 
-from flagscale.inference.core.diffusion.horizonkv.algorithm.backbone import WanDiffusionWrapper
+from flagscale.inference.core.diffusion.horizonkv.wan.backbone import WanDiffusionWrapper
 from flagscale.inference.core.diffusion.horizonkv.algorithm.pipeline import CausalInferencePipeline
-from flagscale.inference.core.diffusion.horizonkv.algorithm.scheduler import FlowMatchScheduler
-from flagscale.inference.core.diffusion.horizonkv.wan.modules.causal_model import CausalWanModel
+from flagscale.inference.core.diffusion.horizonkv.wan.scheduler import FlowMatchScheduler
+from flagscale.inference.core.diffusion.horizonkv.wan.causal_model import CausalWanModel
 
-from .model_spec import model_config, validate_krea_checkpoint
+from .wan.loading import load_krea_model as load_wan_checkpoint
 
 
 def load_krea_model(checkpoint, *, dtype, local_attn_size, sink_size, long_video_gen):
-    """Load all distilled tensors strictly without loading the 57 GB teacher first."""
-    validate_krea_checkpoint(checkpoint)
-    with init_empty_weights():
-        model = CausalWanModel(
-            **model_config("krea-14b"),
-            local_attn_size=local_attn_size,
-            sink_size=sink_size,
-            long_video_gen=long_video_gen,
-        )
-    expected = model.state_dict()
-    with safe_open(checkpoint, framework="pt", device="cpu") as tensors:
-        actual = {key.removeprefix("model.") for key in tensors.keys()}
-        if actual != set(expected):
-            raise ValueError(
-                f"Krea checkpoint keys mismatch: missing={sorted(set(expected) - actual)}, "
-                f"unexpected={sorted(actual - set(expected))}"
-            )
-        # Validate EVERY shape before reading tens of gigabytes of tensor data.
-        for name, tensor in expected.items():
-            shape = tuple(tensors.get_slice(f"model.{name}").get_shape())
-            if shape != tuple(tensor.shape):
-                raise ValueError(f"Krea checkpoint shape mismatch for {name}: {shape}")
-        weights = {name: tensors.get_tensor(f"model.{name}").to(dtype=dtype) for name in expected}
-    model.load_state_dict(weights, strict=True, assign=True)
-    if any(p.is_meta for p in model.parameters()):
-        raise RuntimeError("Krea loading left uninitialized parameters")
-    return model.eval().requires_grad_(False)
+    return load_wan_checkpoint(
+        checkpoint, CausalWanModel, dtype=dtype, local_attn_size=local_attn_size,
+        sink_size=sink_size, long_video_gen=long_video_gen,
+    )
 
 
 class LoadedWanDiffusionWrapper(WanDiffusionWrapper):

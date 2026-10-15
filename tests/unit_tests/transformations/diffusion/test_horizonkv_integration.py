@@ -298,16 +298,15 @@ def native_adapter():
     return native
 
 
-@pytest.mark.parametrize("mode", ["dense", "offload", "local"])
-def test_14b_all_cache_modes_and_cross_attention_use_model_geometry(
-    native_adapter, monkeypatch, mode
+def test_14b_host_cache_and_cross_attention_use_model_geometry(
+    native_adapter, monkeypatch
 ):
     from flagscale.inference.core.diffusion.horizonkv.algorithm import pipeline as pipeline_module
 
     cls = native_adapter.SizedCausalInferencePipeline
     pipe = object.__new__(cls)
     torch.nn.Module.__init__(pipe)
-    config = SimpleNamespace(cpu_offload_kv=mode == "offload", layer_has_sparse=lambda *_: True)
+    config = SimpleNamespace(cpu_offload_kv=True, layer_has_sparse=lambda *_: True)
     model = SimpleNamespace(num_heads=40, dim=5120, text_len=3, kv_sparse_config=config)
     pipe.generator = SimpleNamespace(model=model)
     pipe.num_transformer_blocks = 40
@@ -320,18 +319,12 @@ def test_14b_all_cache_modes_and_cross_attention_use_model_geometry(
         return {"allocated": True}
 
     monkeypatch.setattr(pipeline_module, "build_kv_cache_state", build)
-    monkeypatch.setattr(pipeline_module, "build_local_kv_cache_state", build)
-    monkeypatch.setattr(pipeline_module, "uses_fast_lf_rope_local", lambda _: mode == "local")
     pipe._initialize_kv_cache(1, torch.bfloat16, "cpu", frame_capacity=6, kv_cache_size_override=12)
     pipe._initialize_crossattn_cache(1, torch.bfloat16, "cpu")
     assert len(pipe.kv_cache1) == len(pipe.crossattn_cache) == 40
-    if mode == "dense":
-        assert pipe.kv_cache1[-1]["k"].shape == (1, 12, 40, 128)
-        assert pipe.kv_cache1[-1]["v"].shape == (1, 12, 40, 128)
-    else:
-        assert len(calls) == 40
-        assert all(c["num_heads"] == 40 and c["head_dim"] == 128 for c in calls)
-        assert all(c["frame_capacity"] == 6 for c in calls)
+    assert len(calls) == 40
+    assert all(c["num_heads"] == 40 and c["head_dim"] == 128 for c in calls)
+    assert all(c["frame_capacity"] == 6 for c in calls)
     assert all(c["k"].shape == (1, 3, 40, 128) and not c["is_init"] for c in pipe.crossattn_cache)
 
 
@@ -351,3 +344,75 @@ def test_default_config_is_14b_with_rasa_and_oae():
         assert original.inference.engine.pipeline.from_pretrained.model_variant == "krea-14b"
         assert original.inference.engine.pipeline.from_pretrained.horizonkv.min_frames == 5
         assert not original.inference.engine.pipeline.from_pretrained.horizonkv.no_overlap
+
+
+def test_shared_wan_components_preserve_transformer_checkpoint_layout():
+    from flagscale.inference.core.diffusion.horizonkv.wan.baseline_causal_model import (
+        CausalWanModel as BaselineModel,
+    )
+    from flagscale.inference.core.diffusion.horizonkv.wan.causal_model import (
+        CausalWanModel as HorizonModel,
+    )
+
+    geometry = dict(dim=48, ffn_dim=64, freq_dim=16, text_dim=16, num_heads=4, num_layers=1)
+    with torch.device("meta"):
+        baseline = BaselineModel(**geometry)
+        horizon = HorizonModel(**geometry)
+    assert {k: v.shape for k, v in baseline.state_dict().items()} == {
+        k: v.shape for k, v in horizon.state_dict().items()
+    }
+
+
+def test_shared_vae_preserves_branch_specific_temporal_resampling():
+    from flagscale.inference.core.diffusion.horizonkv.wan import baseline_vae as baseline
+    from flagscale.inference.core.diffusion.horizonkv.wan import vae as horizon
+
+    geometry = dict(dim=4, z_dim=2, dim_mult=[1, 2], num_res_blocks=1, temperal_downsample=[True])
+    with torch.device("meta"):
+        a = baseline.WanVAE_(**geometry)
+        b = horizon.WanVAE_(**geometry)
+    b.load_state_dict(a.state_dict(), strict=True)
+    for model, resample in ((a, baseline.Resample), (b, horizon.Resample)):
+        assert any(isinstance(m, resample) for m in model.encoder.modules())
+        assert any(isinstance(m, resample) for m in model.decoder.modules())
+    assert baseline.Resample is not horizon.Resample
+
+
+def test_horizonkv_rejects_removed_gpu_window_cache(native_adapter):
+    pipe = object.__new__(native_adapter.SizedCausalInferencePipeline)
+    torch.nn.Module.__init__(pipe)
+    pipe.generator = SimpleNamespace(
+        model=SimpleNamespace(num_heads=4, dim=48, kv_sparse_config=None)
+    )
+    with pytest.raises(ValueError, match="cpu_offload_kv=true"):
+        pipe._initialize_kv_cache(1, torch.bfloat16, "cpu")
+
+
+@pytest.mark.parametrize("dense", [True, False])
+def test_shared_backbone_preserves_dense_and_sparse_cache_interfaces(dense):
+    from flagscale.inference.core.diffusion.horizonkv.wan.backbone import (
+        DenseWanDiffusionWrapper,
+        WanDiffusionWrapper,
+    )
+
+    wrapper_cls = DenseWanDiffusionWrapper if dense else WanDiffusionWrapper
+    wrapper = object.__new__(wrapper_cls)
+    torch.nn.Module.__init__(wrapper)
+    calls = []
+
+    def model(x, **kwargs):
+        calls.append(kwargs)
+        return torch.zeros_like(x)
+
+    wrapper.model = model
+    wrapper.uniform_timestep = False
+    wrapper.seq_len = 12
+    wrapper._convert_flow_pred_to_x0 = lambda **kwargs: kwargs["xt"]
+    latent = torch.randn(1, 3, 16, 2, 2)
+    flow, predicted = wrapper(
+        latent, {"prompt_embeds": "context"}, torch.ones(1, 3),
+        kv_cache=[{}], crossattn_cache=[{}], current_start=0, kv_cache_update=True,
+    )
+    assert flow.shape == predicted.shape == latent.shape
+    assert ("kv_cache_update" in calls[0]) == (not dense)
+    assert ("sink_recache_after_switch" in calls[0]) == (not dense)

@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import math
 import os
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -58,23 +57,8 @@ class KVSparseConfig:
     score_with_unroped_qk: bool
     rope_semantics: str
     selector: str
-    lightforcing_sparsity: float
-    lightforcing_sparsity_base: float | None
-    lightforcing_local_attn_size: int
-    lightforcing_num_output_frames: int
-    lightforcing_frame_seq: int
-    lightforcing_keep_frames: int
-    lightforcing_keep_sink: int
-    lightforcing_keep_near: int
-    visualize_attn_mask: bool
-    visualize_output_dir: str | None
-    visualize_layers: set[int] | None
-    visualize_heads: set[int] | None
-    visualize_timesteps: set[str] | None
-    visualize_full_indices: bool
     source_path: str | None
     source_stem: str | None
-    visualize_run_name: str | None
     profile_cache_hit: bool
     profile_onload: bool
     profile_onload_sync_cuda: bool
@@ -87,7 +71,6 @@ class KVSparseConfig:
     profile_sync_cuda: bool
     profile_log_every: int
     profile_verbose: bool
-    _visualization_index: int = field(default=0, init=False, repr=False)
     _profile_index: int = field(default=0, init=False, repr=False)
     _profile_score_ms_total: float = field(default=0.0, init=False, repr=False)
     _profile_rule_ms_total: float = field(default=0.0, init=False, repr=False)
@@ -248,11 +231,9 @@ class KVSparseConfig:
             "sdpa",
         ):
             return "block_sparse_attention"
-        if value in ("lightforcing_triton", "lightforcing", "lf_triton"):
-            return "lightforcing_triton"
         raise ValueError(
             f"Unsupported block_compute_backend '{value}'. Supported backends are "
-            "block_sparse_attention and lightforcing_triton."
+            "block_sparse_attention."
         )
 
     def _frame_level_has_sparse(self, layer: int, num_heads: int) -> bool:
@@ -281,9 +262,6 @@ class KVSparseConfig:
         return True
 
     def layer_has_sparse(self, layer: int, num_heads: int) -> bool:
-        if self.selector == "lightforcing":
-            # LightForcing block sparsity is independent of frame density.
-            return float(self.lightforcing_sparsity) > 1e-6
         frame_sparse = self._frame_level_has_sparse(layer, num_heads)
         if self.granularity != "kv_frame_then_attn_block":
             return frame_sparse
@@ -309,22 +287,6 @@ def _truthy(value: Any) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
-def _parse_index_filter(value: Any) -> set[int] | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        text = value.strip()
-        if not text or text.lower() in ("all", "*"):
-            return None
-        items = [part.strip() for part in text.split(",") if part.strip()]
-        return {int(part) for part in items}
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return {int(value)}
-    if isinstance(value, (list, tuple, set)):
-        return {int(v) for v in value}
-    return {int(value)}
-
-
 def _nonnegative_int(value: Any, default: int = 0) -> int:
     try:
         return max(0, int(value))
@@ -341,74 +303,6 @@ def _optional_nonnegative_int(value: Any) -> int | None:
         return max(0, int(value))
     except (TypeError, ValueError):
         return None
-
-
-def _scalarize_timestep(value: Any) -> Any:
-    if value is None:
-        return None
-    if isinstance(value, torch.Tensor):
-        if value.numel() == 0:
-            return None
-        return value.detach().flatten()[0].item()
-    if isinstance(value, (list, tuple)):
-        if not value:
-            return None
-        return _scalarize_timestep(value[0])
-    return value
-
-
-def _normalize_timestep_token(value: Any) -> str:
-    value = _scalarize_timestep(value)
-    if value is None:
-        return "unknown"
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return "unknown"
-        try:
-            value = float(text)
-        except ValueError:
-            return text
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        val = float(value)
-        if math.isfinite(val) and abs(val - round(val)) <= 1e-6:
-            return str(int(round(val)))
-        return f"{val:.6f}".rstrip("0").rstrip(".")
-    return str(value)
-
-
-def _parse_timestep_filter(value: Any) -> set[str] | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        text = value.strip()
-        if not text or text.lower() in ("all", "*"):
-            return None
-        items = [part.strip() for part in text.split(",") if part.strip()]
-    elif isinstance(value, (list, tuple, set)):
-        items = list(value)
-    else:
-        items = [value]
-    return {_normalize_timestep_token(item) for item in items}
-
-
-def _format_filter(values: set[int] | set[str] | None) -> str:
-    if values is None:
-        return "all"
-    if not values:
-        return "(empty)"
-    return ",".join(str(v) for v in sorted(values))
-
-
-def _sanitize_token(value: Any, default: str) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return default
-    text = re.sub(r"[^A-Za-z0-9._-]+", "-", text)
-    text = text.strip("-._")
-    if not text:
-        return default
-    return text[:80]
 
 
 def load_kv_sparse_config(path: str | Path) -> KVSparseConfig | None:
@@ -536,12 +430,10 @@ def load_kv_sparse_config(path: str | Path) -> KVSparseConfig | None:
         "sdpa",
     ):
         block_compute_backend = "block_sparse_attention"
-    elif block_compute_backend in ("lightforcing_triton", "lightforcing", "lf_triton"):
-        block_compute_backend = "lightforcing_triton"
     else:
         raise ValueError(
             f"Unsupported block_compute_backend '{block_compute_backend}'. Supported backends are "
-            "block_sparse_attention and lightforcing_triton."
+            "block_sparse_attention."
         )
     block_force_dense_compulsory_frames = bool(
         data.get("block_force_dense_compulsory_frames", True)
@@ -588,29 +480,6 @@ def load_kv_sparse_config(path: str | Path) -> KVSparseConfig | None:
         # Keep block scoring pool and kernel block size locked together.
         importance_q_pool = abq
         importance_k_pool = abk
-    visualize_attn_mask = _truthy(
-        os.getenv("HORIZONKV_VIS_ENABLED", data.get("visualize_attn_mask", False))
-    )
-    visualize_output_dir_raw = os.getenv(
-        "HORIZONKV_VIS_DIR",
-        str(data.get("visualize_output_dir", "") or "").strip(),
-    )
-    visualize_output_dir = str(visualize_output_dir_raw).strip() or None
-    if visualize_attn_mask and visualize_output_dir is None:
-        visualize_output_dir = str(Path("logs/kv_sparse_attn_mask") / path.stem)
-    visualize_layers = _parse_index_filter(
-        os.getenv("HORIZONKV_VIS_LAYERS", data.get("visualize_layers", None))
-    )
-    visualize_heads = _parse_index_filter(
-        os.getenv("HORIZONKV_VIS_HEADS", data.get("visualize_heads", None))
-    )
-    visualize_timesteps = _parse_timestep_filter(
-        os.getenv("HORIZONKV_VIS_TIMESTEPS", data.get("visualize_timesteps", None))
-    )
-    visualize_full_indices = _truthy(
-        os.getenv("HORIZONKV_VIS_FULL_INDICES", data.get("visualize_full_indices", False))
-    )
-    visualize_run_name = str(os.getenv("HORIZONKV_VIS_RUN_NAME", "")).strip() or None
     profile_frame_selection = _truthy(
         os.getenv("HORIZONKV_PROFILE_FRAME_SELECTION", data.get("profile_frame_selection", False))
     )
@@ -820,11 +689,10 @@ def load_kv_sparse_config(path: str | Path) -> KVSparseConfig | None:
     rope_semantics = str(
         data.get("rope_semantics", data.get("cache_rope_semantics", "absolute"))
     ).strip().lower()
-    if rope_semantics in ("", "absolute", "standard", "longlive", "global_absolute"):
+    if rope_semantics in ("", "absolute", "standard", "global_absolute"):
         rope_semantics = "absolute"
     elif rope_semantics in (
         "horizonkv_compacted",
-        "lightforcing_compacted_fast",
         "lf_compacted_window_fast",
         "lf_window_fast",
     ):
@@ -838,33 +706,9 @@ def load_kv_sparse_config(path: str | Path) -> KVSparseConfig | None:
             f"{rope_semantics!r}; expected 'absolute' or "
             "'horizonkv_compacted'"
         )
-    selector = str(data.get("selector", data.get("block_selector", "longlive"))).strip().lower()
-    if selector == "horizonkv":
-        selector = "longlive"
-    if selector in ("lf", "light_forcing", "lightforcing_hierarchical"):
-        selector = "lightforcing"
-    if selector not in ("longlive", "lightforcing"):
-        raise ValueError(f"Unsupported kv sparse selector: {selector!r}")
-    lightforcing_sparsity = float(data.get("sparsity", data.get("lightforcing_sparsity", 0.85)))
-    lightforcing_sparsity_base_raw = data.get(
-        "sparsity_base", data.get("lightforcing_sparsity_base", None)
-    )
-    lightforcing_sparsity_base = (
-        float(lightforcing_sparsity_base_raw)
-        if lightforcing_sparsity_base_raw is not None
-        else None
-    )
-    lightforcing_local_attn_size = int(
-        data.get("local_attn_size", data.get("lightforcing_local_attn_size", 12))
-    )
-    lightforcing_num_output_frames = max(
-        1,
-        int(data.get("num_output_frames", data.get("lightforcing_num_output_frames", 120))),
-    )
-    lightforcing_frame_seq = max(1, int(data.get("frame_seq", data.get("lightforcing_frame_seq", 1560))))
-    lightforcing_keep_frames = max(0, int(data.get("keep_frames", data.get("lightforcing_keep_frames", 3))))
-    lightforcing_keep_sink = max(0, int(data.get("keep_sink", data.get("lightforcing_keep_sink", 0))))
-    lightforcing_keep_near = max(0, int(data.get("keep_near", data.get("lightforcing_keep_near", 1))))
+    selector = str(data.get("selector", data.get("block_selector", "horizonkv"))).strip().lower()
+    if selector != "horizonkv":
+        raise ValueError(f"Unsupported kv sparse selector: {selector!r}; use horizonkv")
     predict_next_layer_query = _truthy(
         os.getenv(
             "HORIZONKV_PREDICT_NEXT_LAYER_QUERY",
@@ -914,23 +758,8 @@ def load_kv_sparse_config(path: str | Path) -> KVSparseConfig | None:
         score_with_unroped_qk=bool(score_with_unroped_qk),
         rope_semantics=rope_semantics,
         selector=selector,
-        lightforcing_sparsity=lightforcing_sparsity,
-        lightforcing_sparsity_base=lightforcing_sparsity_base,
-        lightforcing_local_attn_size=lightforcing_local_attn_size,
-        lightforcing_num_output_frames=lightforcing_num_output_frames,
-        lightforcing_frame_seq=lightforcing_frame_seq,
-        lightforcing_keep_frames=lightforcing_keep_frames,
-        lightforcing_keep_sink=lightforcing_keep_sink,
-        lightforcing_keep_near=lightforcing_keep_near,
-        visualize_attn_mask=visualize_attn_mask,
-        visualize_output_dir=visualize_output_dir,
-        visualize_layers=visualize_layers,
-        visualize_heads=visualize_heads,
-        visualize_timesteps=visualize_timesteps,
-        visualize_full_indices=visualize_full_indices,
         source_path=str(path),
         source_stem=path.stem,
-        visualize_run_name=visualize_run_name,
         profile_cache_hit=profile_cache_hit,
         profile_onload=profile_onload,
         profile_onload_sync_cuda=profile_onload_sync_cuda,
@@ -953,14 +782,6 @@ def attach_kv_sparse_to_model(model: torch.nn.Module, path: str | Path | None) -
     if cfg is not None:
         c = cfg
         extra = f"rule={c.rule} target_density={c.target_density}"
-        if c.selector != "longlive":
-            extra += f" selector={c.selector}"
-            extra += (
-                f" lf_sparsity={c.lightforcing_sparsity}"
-                f" lf_keep_frames={c.lightforcing_keep_frames}"
-                f" lf_keep_sink={c.lightforcing_keep_sink}"
-                f" lf_keep_near={c.lightforcing_keep_near}"
-            )
         extra += f" cpu_offload_kv={c.cpu_offload_kv}"
         if c.gpu_cache_frames is not None:
             extra += f" gpu_cache_frames={c.gpu_cache_frames}"
@@ -1019,11 +840,6 @@ def attach_kv_sparse_to_model(model: torch.nn.Module, path: str | Path | None) -
                 f"rule={c.rule} {budget} "
                 f"block_compute_backend={c.block_compute_backend}"
             )
-            if c.selector == "lightforcing":
-                print(
-                    "[horizonkv] lightforcing_compute_backend=lightforcing_triton "
-                    "(selector + sparse attention kernel)"
-                )
         if c.granularity == "kv_frame_then_attn_block":
             block_budget = (
                 f"block_target_recall={c.block_target_recall}"
@@ -1037,15 +853,6 @@ def attach_kv_sparse_to_model(model: torch.nn.Module, path: str | Path | None) -
                 f"block_density_scale_by_max_kv_frames={c.block_density_scale_by_max_kv_frames} "
                 f"block_compute_backend={c.block_compute_backend} "
                 f"block_force_dense_compulsory_frames={c.block_force_dense_compulsory_frames}"
-            )
-        if c.visualize_attn_mask:
-            print(
-                f"[horizonkv] visualize_attn_mask=ON dir={c.visualize_output_dir} "
-                f"run={c.visualize_run_name or 'run'} cfg={c.source_stem or 'cfg'} "
-                f"layers={_format_filter(c.visualize_layers)} "
-                f"heads={_format_filter(c.visualize_heads)} "
-                f"timesteps={_format_filter(c.visualize_timesteps)} "
-                f"full_indices={c.visualize_full_indices}"
             )
         if c.profile_frame_selection:
             print(
@@ -1084,12 +891,6 @@ __all__ = [
     "DEFAULT_IMPORTANCE_K_POOL",
     "DEFAULT_IMPORTANCE_Q_POOL",
     "KVSparseConfig",
-    "_format_filter",
-    "_normalize_timestep_token",
-    "_parse_index_filter",
-    "_parse_timestep_filter",
-    "_sanitize_token",
-    "_scalarize_timestep",
     "_truthy",
     "attach_kv_sparse_to_model",
     "load_kv_sparse_config",

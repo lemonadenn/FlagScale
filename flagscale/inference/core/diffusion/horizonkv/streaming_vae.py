@@ -1,10 +1,10 @@
-# Adapted from Krea realtime-video; see ar_diffusion/NOTICE and LICENSE.md.
+# Adapted from Krea realtime-video; see NOTICE and licenses/CC-BY-NC-SA-4.0.md.
 from typing import List
 from einops import rearrange
 import torch
 import torch.nn as nn
 
-from .ar_diffusion.vae import AttentionBlock, CausalConv3d, RMS_norm, ResidualBlock, Upsample
+from .wan.baseline_vae import AttentionBlock, CausalConv3d, RMS_norm, ResidualBlock, Upsample
 
 class Resample(nn.Module):
 

@@ -1,8 +1,9 @@
-# Adapted from Krea realtime-video; see NOTICE and LICENSE.md.
+# Adapted from Krea realtime-video; see ../NOTICE and ../licenses/CC-BY-NC-SA-4.0.md.
 import functools
-from .attention import attention
+from .attention import baseline_attention as attention
 import math
-from .model import (
+from .baseline_model import (
+    WanModel,
     WanRMSNorm,
     rope_apply,
     WanLayerNorm,
@@ -20,6 +21,9 @@ import torch
 flex_attention = torch.compile(
     flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
 
+
+from .model import causal_rope_apply, CausalHead
+
 def rope_params_riflex(max_seq_len, dim, theta=10000, k=0, L_test=None):
     assert dim % 2 == 0
     omega = 1.0 / torch.pow(theta,
@@ -30,22 +34,22 @@ def rope_params_riflex(max_seq_len, dim, theta=10000, k=0, L_test=None):
     freqs = torch.outer(
         torch.arange(max_seq_len),
         omega)
-                        
+
     freqs = torch.polar(torch.ones_like(freqs), freqs)
     return freqs
 
 @functools.lru_cache(maxsize=32)
 def get_sdpa_mask(
-    device: str, 
+    device: str,
     num_frames: int = 21,
-    frame_seqlen: int = 1560, 
-    num_frame_per_block: int = 1, 
+    frame_seqlen: int = 1560,
+    num_frame_per_block: int = 1,
     local_attn_size: int = -1,
     dtype: torch.dtype = torch.bool
 ):
     """
     Create an attention mask tensor for torch.nn.functional.scaled_dot_product_attention
-    
+
     Args:
         device: Device to create the mask on
         num_frames: Number of frames
@@ -53,7 +57,7 @@ def get_sdpa_mask(
         num_frame_per_block: Number of frames per block
         local_attn_size: Local attention window size (-1 for global)
         dtype: Data type for the mask (torch.bool for masking, torch.float for additive)
-    
+
     Returns:
         torch.Tensor: Attention mask of shape (seq_len, seq_len)
                      - True/1.0 for allowed attention
@@ -68,7 +72,7 @@ def get_sdpa_mask(
 
     # Create the ends array (same logic as original)
     ends = torch.zeros(full_length, device=device, dtype=torch.long)
-    
+
     frame_indices = torch.arange(
         start=0,
         end=total_length,
@@ -91,7 +95,7 @@ def get_sdpa_mask(
     else:
         # Local attention within blocks + diagonal
         local_window_start = ends[q_indices] - local_attn_size * frame_seqlen
-        mask = ((kv_indices < ends[q_indices]) & 
+        mask = ((kv_indices < ends[q_indices]) &
                 (kv_indices >= local_window_start)) | (q_indices == kv_indices)
 
     if dtype == torch.bool:
@@ -138,36 +142,6 @@ def get_block_mask(
                                     KV_LEN=total_length + padded_length, _compile=False, device=device)
     return block_mask
 
-def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
-    n, c = x.size(2), x.size(3) // 2
-
-    # split freqs
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
-
-    # loop over samples
-    output = []
-
-    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
-        seq_len = f * h * w
-
-        # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
-            seq_len, n, -1, 2))
-        freqs_i = torch.cat([
-            freqs[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-            dim=-1).reshape(seq_len, 1, -1)
-
-        # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, seq_len:]])
-
-        # append to collection
-        output.append(x_i)
-    return torch.stack(output).type_as(x)
-
 
 class CausalWanSelfAttention(nn.Module):
 
@@ -197,7 +171,7 @@ class CausalWanSelfAttention(nn.Module):
         self.o = nn.Linear(dim, dim)
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-    
+
     @torch.no_grad()
     def fuse_projections(self):
         # if not self.is_cross_attention:
@@ -342,7 +316,7 @@ class CausalWanSelfAttention(nn.Module):
                     kernel_options={
                         "BLOCKS_ARE_CONTIGUOUS": True,
                     }
-                    
+
                 )[:, :, :-padded_length].transpose(2, 1)
         else:
             # frame_seqlen = math.prod(grid_sizes[0][1:]).item() # torch compile doesn't like this
@@ -377,7 +351,7 @@ class CausalWanSelfAttention(nn.Module):
                 kv_cache["v"][:, local_start_index:local_end_index] = v
             else:
                 # Assign new keys/values directly up to current_end
-                local_end_index = kv_cache["local_end_index"]  + current_end - kv_cache["global_end_index"] 
+                local_end_index = kv_cache["local_end_index"]  + current_end - kv_cache["global_end_index"]
                 local_start_index = local_end_index - num_new_tokens
                 kv_cache["k"][:, local_start_index:local_end_index] = roped_key
                 kv_cache["v"][:, local_start_index:local_end_index] = v
@@ -490,38 +464,7 @@ class CausalWanAttentionBlock(nn.Module):
         return x
 
 
-class CausalHead(nn.Module):
-
-    def __init__(self, dim, out_dim, patch_size, eps=1e-6):
-        super().__init__()
-        self.dim = dim
-        self.out_dim = out_dim
-        self.patch_size = patch_size
-        self.eps = eps
-
-        # layers
-        out_dim = math.prod(patch_size) * out_dim
-        self.norm = WanLayerNorm(dim, eps)
-        self.head = nn.Linear(dim, out_dim)
-
-        # modulation
-        self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
-
-    def forward(self, x, e):
-        r"""
-        Args:
-            x(Tensor): Shape [B, L1, C]
-            e(Tensor): Shape [B, F, 1, C]
-        """
-        # assert e.dtype == torch.float32
-        # with amp.autocast(dtype=torch.float32):
-        num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
-        e = (self.modulation.unsqueeze(1) + e).chunk(2, dim=2)
-        x = (self.head(self.norm(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]))
-        return x
-
-
-class CausalWanModel(ModelMixin, ConfigMixin):
+class CausalWanModel(WanModel):
     r"""
     Wan diffusion backbone supporting both text-to-video and image-to-video.
     """
@@ -588,7 +531,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 Epsilon value for normalization layers
         """
 
-        super().__init__()
+        ModelMixin.__init__(self)
 
         assert model_type in ['t2v', 'i2v']
         self.model_type = model_type
@@ -655,8 +598,6 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.num_frame_per_block = 1
         self.independent_first_frame = False
 
-    def _set_gradient_checkpointing(self, module, value=False):
-        self.gradient_checkpointing = value
 
     @staticmethod
     def _prepare_blockwise_causal_attn_mask(
@@ -1113,59 +1054,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self,
         *args,
         **kwargs
-    ):  
+    ):
         result = self._forward_inference(*args, **kwargs)
         # if kwargs.get('kv_cache', None) is not None:
         # else:
         #     result = self._forward_train(*args, **kwargs)
 
         return result
-
-    def unpatchify(self, x, grid_sizes):
-        r"""
-        Reconstruct video tensors from patch embeddings.
-
-        Args:
-            x (List[Tensor]):
-                List of patchified features, each with shape [L, C_out * prod(patch_size)]
-            grid_sizes (Tensor):
-                Original spatial-temporal grid dimensions before patching,
-                    shape [B, 3] (3 dimensions correspond to F_patches, H_patches, W_patches)
-
-        Returns:
-            List[Tensor]:
-                Reconstructed video tensors with shape [C_out, F, H / 8, W / 8]
-        """
-
-        c = self.out_dim
-        out = []
-        for u, v in zip(x, grid_sizes.tolist()):
-            u = u[:math.prod(v)].view(*v, *self.patch_size, c)
-            u = torch.einsum('fhwpqrc->cfphqwr', u)
-            u = u.reshape(c, *[i * j for i, j in zip(v, self.patch_size)])
-            out.append(u)
-        return out
-
-    def init_weights(self):
-        r"""
-        Initialize model parameters using Xavier initialization.
-        """
-
-        # basic init
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-        # init embeddings
-        nn.init.xavier_uniform_(self.patch_embedding.weight.flatten(1))
-        for m in self.text_embedding.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=.02)
-        for m in self.time_embedding.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=.02)
-
-        # init output layer
-        nn.init.zeros_(self.head.head.weight)

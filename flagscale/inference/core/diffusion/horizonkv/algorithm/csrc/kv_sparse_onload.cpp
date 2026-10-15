@@ -90,22 +90,6 @@ void kv_sparse_frame_materialize_varlen_cuda(
     int64_t live_start_index,
     bool has_live);
 
-torch::Tensor kv_sparse_cache_direct_attention_cuda(
-    torch::Tensor q,
-    torch::Tensor gpu_k,
-    torch::Tensor gpu_v,
-    torch::Tensor head_indices,
-    torch::Tensor frame_indices,
-    torch::Tensor slot_indices,
-    torch::Tensor live_k,
-    torch::Tensor live_v,
-    int64_t frame_seqlen,
-    int64_t total_tokens,
-    int64_t num_heads,
-    int64_t gpu_cache_frames,
-    int64_t live_start_index,
-    bool has_live,
-    double softmax_scale);
 
 torch::Tensor kv_sparse_select_pooled_qk_topk_cuda(
     torch::Tensor q,
@@ -135,27 +119,6 @@ void kv_sparse_update_frame_slot_map_cuda(
     torch::Tensor slot_ids,
     torch::Tensor evicted_frame_ids);
 
-int64_t kv_sparse_copy_frame_to_slot_cuda(
-    torch::Tensor cpu_k,
-    torch::Tensor cpu_v,
-    torch::Tensor gpu_k,
-    torch::Tensor gpu_v,
-    int64_t head_id,
-    int64_t frame_id,
-    int64_t slot,
-    int64_t frame_seqlen,
-    int64_t gpu_cache_frames);
-
-int64_t kv_sparse_copy_frames_to_slots_cuda(
-    torch::Tensor cpu_k,
-    torch::Tensor cpu_v,
-    torch::Tensor gpu_k,
-    torch::Tensor gpu_v,
-    torch::Tensor head_ids,
-    torch::Tensor frame_ids,
-    torch::Tensor slot_ids,
-    int64_t frame_seqlen,
-    int64_t gpu_cache_frames);
 
 int64_t kv_sparse_copy_frame_plan_to_slots_cuda(
     torch::Tensor cpu_k,
@@ -179,37 +142,6 @@ int64_t kv_sparse_copy_frame_plan_to_slots_batched_cuda(
     int64_t frame_seqlen,
     int64_t gpu_cache_frames);
 
-int64_t kv_sparse_copy_frame_plan_to_slots_zero_copy_cuda(
-    torch::Tensor cpu_k,
-    torch::Tensor cpu_v,
-    torch::Tensor gpu_k,
-    torch::Tensor gpu_v,
-    torch::Tensor frame_indices,
-    torch::Tensor slot_plan,
-    torch::Tensor copy_plan,
-    int64_t frame_seqlen,
-    int64_t gpu_cache_frames,
-    int64_t copy_count);
-
-int64_t kv_sparse_copy_frames_to_slots_zero_copy_cuda(
-    torch::Tensor cpu_k,
-    torch::Tensor cpu_v,
-    torch::Tensor gpu_k,
-    torch::Tensor gpu_v,
-    torch::Tensor head_ids,
-    torch::Tensor frame_ids,
-    torch::Tensor slot_ids,
-    int64_t frame_seqlen,
-    int64_t gpu_cache_frames);
-
-int64_t kv_sparse_copy_frames_to_staging_cuda(
-    torch::Tensor cpu_k,
-    torch::Tensor cpu_v,
-    torch::Tensor staging_k,
-    torch::Tensor staging_v,
-    torch::Tensor head_ids,
-    torch::Tensor frame_ids,
-    int64_t frame_seqlen);
 
 int64_t kv_sparse_copy_frames_to_compact_cuda(
     torch::Tensor cpu_k,
@@ -222,18 +154,6 @@ int64_t kv_sparse_copy_frames_to_compact_cuda(
     int64_t frame_seqlen,
     bool cpu_head_major);
 
-int64_t kv_sparse_copy_live_runs_to_slots_cuda(
-    torch::Tensor live_k,
-    torch::Tensor live_v,
-    torch::Tensor gpu_k,
-    torch::Tensor gpu_v,
-    torch::Tensor head_ids,
-    torch::Tensor token_starts,
-    torch::Tensor slot_ids,
-    torch::Tensor token_lens,
-    int64_t frame_seqlen,
-    int64_t gpu_live_temp_frames,
-    int64_t dst_token_base);
 
 int64_t kv_sparse_copy_kv_span_to_cpu_cuda(
     torch::Tensor gpu_k_span,
@@ -242,17 +162,6 @@ int64_t kv_sparse_copy_kv_span_to_cpu_cuda(
     torch::Tensor cpu_v,
     int64_t start_token);
 
-int64_t kv_sparse_scatter_staging_to_slots_cuda(
-    torch::Tensor staging_k,
-    torch::Tensor staging_v,
-    torch::Tensor gpu_k,
-    torch::Tensor gpu_v,
-    torch::Tensor head_ids,
-    torch::Tensor slot_ids,
-    torch::Tensor src_rows,
-    torch::Tensor src_cols,
-    int64_t frame_seqlen,
-    int64_t gpu_cache_frames);
 
 int64_t kv_sparse_copy_compact_to_slots_d2d_cuda(
     torch::Tensor compact_k,
@@ -306,31 +215,6 @@ std::unordered_map<int64_t, int64_t> parse_frame_map(const py::handle& handle) {
   return out;
 }
 
-std::vector<int64_t> parse_int_list(const py::handle& handle) {
-  py::sequence seq = py::reinterpret_borrow<py::sequence>(handle);
-  std::vector<int64_t> out;
-  out.reserve(seq.size());
-  for (const auto& item : seq) {
-    out.push_back(py::cast<int64_t>(item));
-  }
-  return out;
-}
-
-py::dict build_frame_map_py(const std::unordered_map<int64_t, int64_t>& mapping) {
-  py::dict out;
-  for (const auto& item : mapping) {
-    out[py::int_(item.first)] = py::int_(item.second);
-  }
-  return out;
-}
-
-py::list build_int_list_py(const std::vector<int64_t>& values) {
-  py::list out;
-  for (int64_t value : values) {
-    out.append(py::int_(value));
-  }
-  return out;
-}
 
 torch::Tensor make_int64_pair_tensor(const std::vector<int64_t>& flat_pairs) {
   if (flat_pairs.empty()) {
@@ -620,307 +504,6 @@ py::dict build_compact_row_plan_cpp(
   return out;
 }
 
-py::object kv_sparse_plan_slots_cpp(
-    torch::Tensor head_indices,
-    torch::Tensor frame_indices,
-    int64_t total_tokens,
-    int64_t frame_seqlen,
-    int64_t num_heads,
-    int64_t gpu_cache_frames,
-    int64_t live_start_index,
-    int64_t live_len,
-    bool has_live,
-    py::list frame_maps_py,
-    py::list slot_frame_ids_py,
-    py::list slot_frame_lens_py,
-    py::list slot_last_used_py,
-    int64_t gpu_clock) {
-  TORCH_CHECK(!head_indices.is_cuda(), "head_indices must be a CPU tensor");
-  TORCH_CHECK(!frame_indices.is_cuda(), "frame_indices must be a CPU tensor");
-  TORCH_CHECK(head_indices.scalar_type() == at::kLong, "head_indices must be int64");
-  TORCH_CHECK(frame_indices.scalar_type() == at::kLong, "frame_indices must be int64");
-  TORCH_CHECK(head_indices.dim() == 1, "head_indices must be 1D");
-  TORCH_CHECK(frame_indices.dim() == 2, "frame_indices must be 2D");
-  TORCH_CHECK(frame_indices.size(0) == head_indices.size(0),
-              "frame_indices/head_indices shape mismatch");
-  TORCH_CHECK(frame_seqlen > 0, "frame_seqlen must be positive");
-  TORCH_CHECK(num_heads > 0, "num_heads must be positive");
-  TORCH_CHECK(gpu_cache_frames > 0, "gpu_cache_frames must be positive");
-  TORCH_CHECK(static_cast<int64_t>(frame_maps_py.size()) >= num_heads, "frame_maps size mismatch");
-  TORCH_CHECK(static_cast<int64_t>(slot_frame_ids_py.size()) >= num_heads, "slot_frame_ids size mismatch");
-  TORCH_CHECK(static_cast<int64_t>(slot_frame_lens_py.size()) >= num_heads, "slot_frame_lens size mismatch");
-  TORCH_CHECK(static_cast<int64_t>(slot_last_used_py.size()) >= num_heads, "slot_last_used size mismatch");
-
-  head_indices = head_indices.contiguous();
-  frame_indices = frame_indices.contiguous();
-  const auto* head_ptr = head_indices.data_ptr<int64_t>();
-  const auto* frame_ptr = frame_indices.data_ptr<int64_t>();
-  const int64_t head_count = head_indices.size(0);
-  const int64_t n_selected = frame_indices.size(1);
-  if (head_count <= 0 || n_selected <= 0 || total_tokens <= 0) {
-    return py::none();
-  }
-
-  auto slot_plan = torch::full(
-      {head_count, n_selected},
-      static_cast<int64_t>(-3),
-      torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU));
-  auto fill_plan = torch::zeros(
-      {head_count, n_selected},
-      torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU));
-  auto copy_plan = torch::zeros(
-      {head_count, n_selected},
-      torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU));
-  auto* slot_plan_ptr = slot_plan.data_ptr<int64_t>();
-  auto* fill_plan_ptr = fill_plan.data_ptr<int64_t>();
-  auto* copy_plan_ptr = copy_plan.data_ptr<int64_t>();
-
-  std::vector<std::unordered_set<int64_t>> history_by_head(static_cast<size_t>(num_heads));
-  std::vector<std::vector<std::tuple<int64_t, int64_t, int64_t>>> valid_history_entries_by_row(
-      static_cast<size_t>(head_count));
-  std::vector<int64_t> used_heads;
-  std::vector<bool> used_head_mask(static_cast<size_t>(num_heads), false);
-
-  const int64_t live_end_index = live_start_index + live_len;
-  for (int64_t row = 0; row < head_count; ++row) {
-    const int64_t head_id = head_ptr[row];
-    if (head_id < 0 || head_id >= num_heads) {
-      continue;
-    }
-    for (int64_t col = 0; col < n_selected; ++col) {
-      const int64_t frame_id = frame_ptr[row * n_selected + col];
-      if (frame_id < 0) {
-        continue;
-      }
-      const int64_t frame_start = frame_id * frame_seqlen;
-      const int64_t frame_len = kv_frame_span_len(frame_id, frame_seqlen, total_tokens);
-      if (frame_len <= 0) {
-        continue;
-      }
-      const int64_t frame_end = frame_start + frame_len;
-      const bool is_live = has_live && frame_start >= live_start_index && frame_end <= live_end_index;
-      if (is_live) {
-        slot_plan_ptr[row * n_selected + col] = -2;
-        continue;
-      }
-      auto& history = history_by_head[static_cast<size_t>(head_id)];
-      history.insert(frame_id);
-      valid_history_entries_by_row[static_cast<size_t>(row)].emplace_back(col, frame_id, frame_len);
-      if (!used_head_mask[static_cast<size_t>(head_id)]) {
-        used_head_mask[static_cast<size_t>(head_id)] = true;
-        used_heads.push_back(head_id);
-      }
-    }
-  }
-
-  for (int64_t head_id : used_heads) {
-    if (static_cast<int64_t>(history_by_head[static_cast<size_t>(head_id)].size()) > gpu_cache_frames) {
-      return py::none();
-    }
-  }
-  std::sort(used_heads.begin(), used_heads.end());
-
-  std::vector<std::unordered_map<int64_t, int64_t>> local_maps(static_cast<size_t>(num_heads));
-  std::vector<std::vector<int64_t>> local_frame_ids(static_cast<size_t>(num_heads));
-  std::vector<std::vector<int64_t>> local_frame_lens(static_cast<size_t>(num_heads));
-  std::vector<std::vector<int64_t>> local_last_used(static_cast<size_t>(num_heads));
-  for (int64_t head_id : used_heads) {
-    const size_t idx = static_cast<size_t>(head_id);
-    local_maps[idx] = parse_frame_map(frame_maps_py[idx]);
-    local_frame_ids[idx] = parse_int_list(slot_frame_ids_py[idx]);
-    local_frame_lens[idx] = parse_int_list(slot_frame_lens_py[idx]);
-    local_last_used[idx] = parse_int_list(slot_last_used_py[idx]);
-    TORCH_CHECK(static_cast<int64_t>(local_frame_ids[idx].size()) == gpu_cache_frames,
-                "slot_frame_ids per-head size mismatch");
-    TORCH_CHECK(static_cast<int64_t>(local_frame_lens[idx].size()) == gpu_cache_frames,
-                "slot_frame_lens per-head size mismatch");
-    TORCH_CHECK(static_cast<int64_t>(local_last_used[idx].size()) == gpu_cache_frames,
-                "slot_last_used per-head size mismatch");
-  }
-
-  std::vector<std::pair<int64_t, int64_t>> hit_wait_pairs;
-  hit_wait_pairs.reserve(static_cast<size_t>(head_count * n_selected));
-  int64_t clock = gpu_clock;
-  for (int64_t row = 0; row < head_count; ++row) {
-    const int64_t head_id = head_ptr[row];
-    if (head_id < 0 || head_id >= num_heads) {
-      continue;
-    }
-    auto& frame_map = local_maps[static_cast<size_t>(head_id)];
-    auto& last_used = local_last_used[static_cast<size_t>(head_id)];
-    for (const auto& entry : valid_history_entries_by_row[static_cast<size_t>(row)]) {
-      const int64_t col = std::get<0>(entry);
-      const int64_t frame_id = std::get<1>(entry);
-      const auto it = frame_map.find(frame_id);
-      if (it == frame_map.end()) {
-        continue;
-      }
-      const int64_t slot = it->second;
-      if (slot < 0 || slot >= gpu_cache_frames) {
-        continue;
-      }
-      slot_plan_ptr[row * n_selected + col] = slot;
-      last_used[static_cast<size_t>(slot)] = clock++;
-      hit_wait_pairs.emplace_back(head_id, slot);
-    }
-  }
-
-  std::unordered_map<uint64_t, std::pair<int64_t, int64_t>> planned_fills;
-  planned_fills.reserve(static_cast<size_t>(head_count * n_selected));
-  auto make_key = [](int64_t head_id, int64_t frame_id) -> uint64_t {
-    return (static_cast<uint64_t>(static_cast<uint32_t>(head_id)) << 32) |
-           static_cast<uint32_t>(frame_id);
-  };
-
-  for (int64_t row = 0; row < head_count; ++row) {
-    const int64_t head_id = head_ptr[row];
-    if (head_id < 0 || head_id >= num_heads) {
-      continue;
-    }
-    auto& frame_map = local_maps[static_cast<size_t>(head_id)];
-    auto& frame_ids = local_frame_ids[static_cast<size_t>(head_id)];
-    auto& frame_lens = local_frame_lens[static_cast<size_t>(head_id)];
-    auto& last_used = local_last_used[static_cast<size_t>(head_id)];
-
-    std::vector<int64_t> free_slots;
-    free_slots.reserve(static_cast<size_t>(gpu_cache_frames));
-    for (int64_t slot = 0; slot < gpu_cache_frames; ++slot) {
-      if (frame_ids[static_cast<size_t>(slot)] < 0) {
-        free_slots.push_back(slot);
-      }
-    }
-
-    for (const auto& entry : valid_history_entries_by_row[static_cast<size_t>(row)]) {
-      const int64_t col = std::get<0>(entry);
-      const int64_t frame_id = std::get<1>(entry);
-      const int64_t frame_len = std::get<2>(entry);
-      if (slot_plan_ptr[row * n_selected + col] != -3) {
-        continue;
-      }
-      const uint64_t key = make_key(head_id, frame_id);
-      const auto planned_it = planned_fills.find(key);
-      if (planned_it != planned_fills.end()) {
-        slot_plan_ptr[row * n_selected + col] = planned_it->second.first;
-        fill_plan_ptr[row * n_selected + col] = 1;
-        continue;
-      }
-
-      int64_t slot = -1;
-      int64_t evicted = -1;
-      if (!free_slots.empty()) {
-        slot = free_slots.back();
-        free_slots.pop_back();
-      } else {
-        int64_t best_last_used = std::numeric_limits<int64_t>::max();
-        for (int64_t candidate = 0; candidate < gpu_cache_frames; ++candidate) {
-          const int64_t candidate_last_used = last_used[static_cast<size_t>(candidate)];
-          if (slot < 0 || candidate_last_used < best_last_used) {
-            slot = candidate;
-            best_last_used = candidate_last_used;
-          }
-        }
-        if (slot < 0) {
-          return py::none();
-        }
-        evicted = frame_ids[static_cast<size_t>(slot)];
-        if (evicted != -1) {
-          frame_map.erase(evicted);
-        }
-      }
-
-      frame_map[frame_id] = slot;
-      frame_ids[static_cast<size_t>(slot)] = frame_id;
-      frame_lens[static_cast<size_t>(slot)] = frame_len;
-      last_used[static_cast<size_t>(slot)] = clock++;
-      planned_fills.emplace(key, std::make_pair(slot, evicted));
-      slot_plan_ptr[row * n_selected + col] = slot;
-      fill_plan_ptr[row * n_selected + col] = 1;
-      copy_plan_ptr[row * n_selected + col] = 1;
-    }
-  }
-
-  std::vector<int64_t> hit_wait_flat;
-  hit_wait_flat.reserve(hit_wait_pairs.size() * 2);
-  for (const auto& pair : hit_wait_pairs) {
-    hit_wait_flat.push_back(pair.first);
-    hit_wait_flat.push_back(pair.second);
-  }
-  torch::Tensor hit_wait_tensor;
-  if (hit_wait_flat.empty()) {
-    hit_wait_tensor = torch::empty({0, 2}, torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU));
-  } else {
-    hit_wait_tensor = torch::from_blob(
-                          hit_wait_flat.data(),
-                          {static_cast<int64_t>(hit_wait_pairs.size()), static_cast<int64_t>(2)},
-                          torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU))
-                          .clone();
-  }
-
-  std::vector<int64_t> fill_head_ids;
-  std::vector<int64_t> fill_frame_ids;
-  std::vector<int64_t> fill_slot_ids;
-  std::vector<int64_t> fill_evicted_frame_ids;
-  fill_head_ids.reserve(planned_fills.size());
-  fill_frame_ids.reserve(planned_fills.size());
-  fill_slot_ids.reserve(planned_fills.size());
-  fill_evicted_frame_ids.reserve(planned_fills.size());
-  std::vector<std::tuple<int64_t, int64_t, int64_t, int64_t>> fill_items;
-  fill_items.reserve(planned_fills.size());
-  for (const auto& item : planned_fills) {
-    const int64_t head_id = static_cast<int64_t>(item.first >> 32);
-    const int64_t frame_id = static_cast<int64_t>(static_cast<uint32_t>(item.first & 0xffffffffULL));
-    fill_items.emplace_back(head_id, frame_id, item.second.first, item.second.second);
-  }
-  std::sort(fill_items.begin(), fill_items.end());
-  for (const auto& item : fill_items) {
-    fill_head_ids.push_back(std::get<0>(item));
-    fill_frame_ids.push_back(std::get<1>(item));
-    fill_slot_ids.push_back(std::get<2>(item));
-    fill_evicted_frame_ids.push_back(std::get<3>(item));
-  }
-
-  auto make_tensor_1d = [](const std::vector<int64_t>& values) {
-    if (values.empty()) {
-      return torch::empty({0}, torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU));
-    }
-    return torch::from_blob(
-               const_cast<int64_t*>(values.data()),
-               {static_cast<int64_t>(values.size())},
-               torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU))
-        .clone();
-  };
-
-  py::list updated_heads_py;
-  py::list frame_maps_out;
-  py::list slot_frame_ids_out;
-  py::list slot_frame_lens_out;
-  py::list slot_last_used_out;
-  for (int64_t head_id : used_heads) {
-    const size_t idx = static_cast<size_t>(head_id);
-    updated_heads_py.append(py::int_(head_id));
-    frame_maps_out.append(build_frame_map_py(local_maps[idx]));
-    slot_frame_ids_out.append(build_int_list_py(local_frame_ids[idx]));
-    slot_frame_lens_out.append(build_int_list_py(local_frame_lens[idx]));
-    slot_last_used_out.append(build_int_list_py(local_last_used[idx]));
-  }
-
-  py::dict out;
-  out["slot_plan"] = slot_plan;
-  out["fill_plan"] = fill_plan;
-  out["copy_plan"] = copy_plan;
-  out["hit_wait_pairs"] = hit_wait_tensor;
-  out["fill_head_ids"] = make_tensor_1d(fill_head_ids);
-  out["fill_frame_ids"] = make_tensor_1d(fill_frame_ids);
-  out["fill_slot_ids"] = make_tensor_1d(fill_slot_ids);
-  out["fill_evicted_frame_ids"] = make_tensor_1d(fill_evicted_frame_ids);
-  out["updated_heads"] = updated_heads_py;
-  out["frame_maps"] = frame_maps_out;
-  out["slot_frame_ids"] = slot_frame_ids_out;
-  out["slot_frame_lens"] = slot_frame_lens_out;
-  out["slot_last_used"] = slot_last_used_out;
-  out["gpu_clock"] = py::int_(clock);
-  return std::move(out);
-}
 
 py::object kv_sparse_plan_slots_tensor_cpp(
     torch::Tensor frame_indices,
@@ -1341,113 +924,13 @@ py::object kv_sparse_plan_slots_tensor_cpp(
   return std::move(out);
 }
 
-int64_t kv_sparse_pack_frames_to_staging_cpp(
-    torch::Tensor cpu_k,
-    torch::Tensor cpu_v,
-    torch::Tensor staging_k,
-    torch::Tensor staging_v,
-    torch::Tensor head_ids,
-    torch::Tensor frame_ids,
-    int64_t frame_seqlen) {
-  TORCH_CHECK(cpu_k.device().is_cpu() && cpu_v.device().is_cpu(), "cpu_k/cpu_v must be CPU tensors");
-  TORCH_CHECK(staging_k.device().is_cpu() && staging_v.device().is_cpu(),
-              "staging_k/staging_v must be CPU tensors");
-  TORCH_CHECK(cpu_k.is_contiguous() && cpu_v.is_contiguous(), "cpu_k/cpu_v must be contiguous");
-  TORCH_CHECK(staging_k.is_contiguous() && staging_v.is_contiguous(),
-              "staging_k/staging_v must be contiguous");
-  TORCH_CHECK(staging_k.is_pinned() && staging_v.is_pinned(),
-              "staging_k/staging_v must be pinned for async HtoD copy");
-  TORCH_CHECK(cpu_k.scalar_type() == cpu_v.scalar_type(), "cpu KV dtype mismatch");
-  TORCH_CHECK(cpu_k.scalar_type() == staging_k.scalar_type(), "cpu/staging dtype mismatch");
-  TORCH_CHECK(cpu_k.scalar_type() == staging_v.scalar_type(), "cpu/staging dtype mismatch");
-  TORCH_CHECK(cpu_k.dim() == 4 && cpu_v.sizes() == cpu_k.sizes(), "cpu KV must be [B,T,H,D]");
-  TORCH_CHECK(staging_k.dim() == 4 && staging_v.sizes() == staging_k.sizes(),
-              "staging KV must be [B*rows,Tstage,1,D]");
-  TORCH_CHECK(head_ids.device().is_cpu() && frame_ids.device().is_cpu(),
-              "head_ids/frame_ids must be CPU tensors");
-  TORCH_CHECK(head_ids.is_contiguous() && frame_ids.is_contiguous(),
-              "head_ids/frame_ids must be contiguous");
-  TORCH_CHECK(head_ids.scalar_type() == at::kLong && frame_ids.scalar_type() == at::kLong,
-              "head_ids/frame_ids must be int64");
-  TORCH_CHECK(head_ids.dim() == 1 && frame_ids.dim() == 2, "head_ids must be 1D and frame_ids 2D");
-  TORCH_CHECK(frame_ids.size(0) == head_ids.size(0), "head/frame row count mismatch");
-  TORCH_CHECK(frame_seqlen > 0, "frame_seqlen must be positive");
-
-  const int64_t B = cpu_k.size(0);
-  const int64_t T = cpu_k.size(1);
-  const int64_t H = cpu_k.size(2);
-  const int64_t D = cpu_k.size(3);
-  const int64_t rows = head_ids.size(0);
-  const int64_t max_selected = frame_ids.size(1);
-  const int64_t token_count = max_selected * frame_seqlen;
-  TORCH_CHECK(staging_k.size(0) == B * rows, "staging batch/row dimension mismatch");
-  TORCH_CHECK(staging_k.size(1) >= token_count, "staging token dimension too small");
-  TORCH_CHECK(staging_k.size(2) == 1 && staging_k.size(3) == D, "staging KV shape mismatch");
-  if (B <= 0 || rows <= 0 || max_selected <= 0 || token_count <= 0) {
-    return 0;
-  }
-
-  const auto* head_ptr = head_ids.data_ptr<int64_t>();
-  const auto* frame_ptr = frame_ids.data_ptr<int64_t>();
-  const size_t elem_size = static_cast<size_t>(cpu_k.element_size());
-  const size_t width_bytes = static_cast<size_t>(D) * elem_size;
-  const char* cpu_k_ptr = static_cast<const char*>(cpu_k.data_ptr());
-  const char* cpu_v_ptr = static_cast<const char*>(cpu_v.data_ptr());
-  char* staging_k_ptr = static_cast<char*>(staging_k.data_ptr());
-  char* staging_v_ptr = static_cast<char*>(staging_v.data_ptr());
-  const int64_t src_batch_stride = T * H * D;
-  const int64_t src_token_stride = H * D;
-  const int64_t dst_row_stride = staging_k.size(1) * D;
-
-  std::atomic<int64_t> packed_items(0);
-  const int64_t total_items = B * rows * max_selected;
-  at::parallel_for(0, total_items, 1, [&](int64_t begin, int64_t end) {
-    int64_t local_count = 0;
-    for (int64_t linear = begin; linear < end; ++linear) {
-      int64_t t = linear;
-      const int64_t col = t % max_selected;
-      t /= max_selected;
-      const int64_t row = t % rows;
-      const int64_t b = t / rows;
-      const int64_t head_id = head_ptr[row];
-      const int64_t frame_id = frame_ptr[row * max_selected + col];
-      if (head_id < 0 || head_id >= H || frame_id < 0) {
-        continue;
-      }
-      const int64_t src_start = frame_id * frame_seqlen;
-      if (src_start >= T) {
-        continue;
-      }
-      const int64_t copy_tokens = std::min<int64_t>(frame_seqlen, T - src_start);
-      if (copy_tokens <= 0) {
-        continue;
-      }
-      const int64_t dst_row = b * rows + row;
-      const int64_t dst_token_start = col * frame_seqlen;
-      for (int64_t tok = 0; tok < copy_tokens; ++tok) {
-        const int64_t src_elem = b * src_batch_stride + (src_start + tok) * src_token_stride + head_id * D;
-        const int64_t dst_elem = dst_row * dst_row_stride + (dst_token_start + tok) * D;
-        std::memcpy(staging_k_ptr + dst_elem * static_cast<int64_t>(elem_size),
-                    cpu_k_ptr + src_elem * static_cast<int64_t>(elem_size),
-                    width_bytes);
-        std::memcpy(staging_v_ptr + dst_elem * static_cast<int64_t>(elem_size),
-                    cpu_v_ptr + src_elem * static_cast<int64_t>(elem_size),
-                    width_bytes);
-      }
-      local_count += 1;
-    }
-    packed_items.fetch_add(local_count, std::memory_order_relaxed);
-  });
-  return packed_items.load(std::memory_order_relaxed);
-}
 
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("kv_sparse_adaptive_count_misses", &kv_sparse_adaptive_count_misses_cpu,
         "Read-only allocation-free live/resident miss count");
-  m.def("kv_sparse_plan_slots", &kv_sparse_plan_slots_cpp,
-        "CPU-side slot planning for sparse KV onload");
+
   m.def("kv_sparse_plan_slots_tensor", &kv_sparse_plan_slots_tensor_cpp,
         "CPU tensor slot planning for sparse KV onload",
         py::arg("frame_indices"), py::arg("frame_to_slot"), py::arg("slot_frame_ids"),
@@ -1461,40 +944,29 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Fused sparse KV frame materialization from GPU slots/live KV (CUDA)");
   m.def("kv_sparse_frame_materialize_varlen", &kv_sparse_frame_materialize_varlen_cuda,
         "Fused sparse KV frame materialization into FlashAttention varlen packed layout (CUDA)");
-  m.def("kv_sparse_cache_direct_attention", &kv_sparse_cache_direct_attention_cuda,
-        "Sparse attention that reads selected KV frames directly from GPU slots/live KV (CUDA)");
+
   m.def("kv_sparse_select_pooled_qk_topk", &kv_sparse_select_pooled_qk_topk_cuda,
         "Fused pooled-QK frame scoring and max-kv-frame selection (CUDA)");
   m.def("kv_sparse_lookup_frame_slots", &kv_sparse_lookup_frame_slots_cuda,
         "GPU all-hit lookup of sparse KV frame slots");
   m.def("kv_sparse_update_frame_slot_map", &kv_sparse_update_frame_slot_map_cuda,
         "Batched GPU update of dense frame-to-slot metadata");
-  m.def("kv_sparse_copy_frame_to_slot", &kv_sparse_copy_frame_to_slot_cuda,
-        "Async HtoD copy of one CPU-offloaded KV frame/head into a GPU slot");
-  m.def("kv_sparse_copy_frames_to_slots", &kv_sparse_copy_frames_to_slots_cuda,
-        "Batched async HtoD copy of CPU-offloaded KV frame/head items into GPU slots");
+
+
   m.def("kv_sparse_copy_frame_plan_to_slots", &kv_sparse_copy_frame_plan_to_slots_cuda,
         "Batched async HtoD copy of a dense CPU KV frame plan into GPU slots");
   m.def("kv_sparse_copy_frame_plan_to_slots_batched", &kv_sparse_copy_frame_plan_to_slots_batched_cuda,
         "One-call CUDA driver batch of pitched HtoD copies from a dense CPU KV frame plan",
         py::call_guard<py::gil_scoped_release>());
-  m.def("kv_sparse_copy_frame_plan_to_slots_zero_copy", &kv_sparse_copy_frame_plan_to_slots_zero_copy_cuda,
-        "Mapped-pinned CPU KV to GPU slot copy from a dense frame plan using one CUDA kernel");
-  m.def("kv_sparse_copy_frames_to_slots_zero_copy", &kv_sparse_copy_frames_to_slots_zero_copy_cuda,
-        "Experimental mapped-pinned CPU KV to GPU slots copy using one CUDA kernel");
-  m.def("kv_sparse_copy_live_runs_to_slots", &kv_sparse_copy_live_runs_to_slots_cuda,
-        "Batched async DtoD copy of live KV token runs into paged temp slots");
+
+
   m.def("kv_sparse_copy_kv_span_to_cpu", &kv_sparse_copy_kv_span_to_cpu_cuda,
         "Async DtoH copy of a contiguous KV token span into pinned CPU cache");
-  m.def("kv_sparse_pack_frames_to_staging", &kv_sparse_pack_frames_to_staging_cpp,
-        "CPU gather of selected KV frame/head items into pinned contiguous staging buffers",
-        py::call_guard<py::gil_scoped_release>());
-  m.def("kv_sparse_copy_frames_to_staging", &kv_sparse_copy_frames_to_staging_cuda,
-        "Batched async HtoD copy of CPU-offloaded KV frame/head items into GPU staging buffers");
+
+
   m.def("kv_sparse_copy_frames_to_compact", &kv_sparse_copy_frames_to_compact_cuda,
         "Batched async HtoD copy of CPU-offloaded KV frame/head items into compact packed GPU buffers");
-  m.def("kv_sparse_scatter_staging_to_slots", &kv_sparse_scatter_staging_to_slots_cuda,
-        "CUDA scatter of staged miss KV into GPU cache slots");
+
   m.def("kv_sparse_copy_compact_to_slots_d2d", &kv_sparse_copy_compact_to_slots_d2d_cuda,
         "Async DtoD copy from packed compact miss KV into GPU cache slots");
 }

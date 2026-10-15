@@ -1,33 +1,32 @@
-HorizonKV — anonymous research artifact
+HorizonKV and Krea autoregressive diffusion inference in FlagScale
 
-This artifact adapts inference code from Self-Forcing and Wan2.1, whose
-repository licenses are Apache-2.0. The adapted
-`wan/modules/causal_model.py` also carries a CC-BY-NC-SA-4.0 file-level notice.
-Changes include sparse KV retrieval, bounded GPU/host
-storage, overlap execution, residency-aware configuration selection, and
-portable inference/experiment entry points. Modified source files carry a
-notice. Model parameter names remain compatible with public checkpoints.
+This package combines the Wan model components used by HorizonKV and the dense
+Krea efficiency baseline. Common T5, tokenizer, scheduler, embeddings, model
+initialization and VAE code live in wan/. baseline_* modules retain the dense
+attention, KV recomputation and temporal resampling differences; pipeline.py
+is the production HorizonKV entry and baseline.py is the comparison entry.
 
-Third-party attributions refer to public dependencies, not submission authors.
-The relevant upstream projects are Self-Forcing, Wan2.1, and FramePack.
-- LightForcing-derived attention/selection primitives are identified in
-  horizonkv/sparse_kernels.py and horizonkv/baseline_selector.py.
-- The sparse attention implementation is based on the open-source
-  Block-Sparse-Attention library, with modifications for HorizonKV:
-  https://github.com/lemonadenn/Block-Sparse-Attention.git (fork of https://github.com/mit-han-lab/Block-Sparse-Attention.git)
-  This modified backend is included in the HorizonKV package's
-  third_party/Block-Sparse-Attention directory and
-  supplies the 64x64 and variable-length paths used by HorizonKV.
-  Retain its BSD license and the upstream notices on bundled kernel sources.
+Sources and licenses:
+- Wan2.1 (Copyright 2024-2025 The Alibaba Wan Team Authors), Self-Forcing and
+  FramePack: upstream Apache-2.0 notices are retained in their adapted files.
+  The Apache-2.0 text is retained in licenses/Apache-2.0.txt.
+- Krea realtime-video: https://github.com/krea-ai/realtime-video
+  Revision acf4b7b4e1a3049a0e04782e751d12203334038d; original source hashes
+  are recorded in provenance.json. Its CC-BY-NC-SA-4.0 license is retained in
+  licenses/CC-BY-NC-SA-4.0.md. The adapted causal model sources and shared causal
+  primitives retain their file-level CC-BY-NC-SA-4.0 notice.
+- LightForcing-derived compacted RoPE primitives are retained in
+  algorithm/sparse_kernels.py; the separate baseline selector is excluded.
+- The modified Block-Sparse-Attention backend supplies the 64x64 and variable
+  length paths used by HorizonKV:
+  https://github.com/lemonadenn/Block-Sparse-Attention.git
+  (fork of https://github.com/mit-han-lab/Block-Sparse-Attention.git).
+  Its BSD license and upstream notices remain in third_party/Block-Sparse-Attention.
 
-Upstream copyright and license notices are retained. No trained weights,
-benchmark videos, experiment logs, development history, or author affiliation
-information is distributed with this artifact. Downloaded model weights and
-evaluation datasets remain subject to their respective licenses.
-
-FlagScale integration (2026): inference modules have been moved into the
-flagscale.inference.core.diffusion.horizonkv namespace. Research launchers,
-ablation/reproduction scripts and the standalone CLI are excluded. Runtime
-configuration and 14B model loading are owned by FlagScale. The modified
-Block-Sparse-Attention dependency is at
-FlagScale/flagscale/inference/core/diffusion/horizonkv/third_party/Block-Sparse-Attention.
+FlagScale modifications include frame retrieval, bounded GPU/host KV storage,
+overlap execution, residency-aware selection, shared Wan components and separate
+inference loops. The dense baseline preserves Krea's five-step schedule,
+context reconstruction, boundary reencoding and streaming FP16 VAE. The server,
+webcam/video input, training, research launchers and evaluation code are excluded.
+Model tensor names remain compatible with the public checkpoints. No weights or
+evaluation datasets are distributed with this package.

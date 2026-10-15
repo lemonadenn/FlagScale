@@ -1,8 +1,9 @@
 # Modified for the HorizonKV inference artifact; see NOTICE.
 # Derived from the included causal inference adapter; see NOTICE.
 # SPDX-License-Identifier: CC-BY-NC-SA-4.0
-from flagscale.inference.core.diffusion.horizonkv.wan.modules.attention import attention
-from flagscale.inference.core.diffusion.horizonkv.wan.modules.model import (
+from flagscale.inference.core.diffusion.horizonkv.wan.attention import attention
+from flagscale.inference.core.diffusion.horizonkv.wan.model import (
+    WanModel,
     WanRMSNorm,
     rope_apply,
     WanLayerNorm,
@@ -19,8 +20,6 @@ import os
 import torch.nn as nn
 import torch
 import math
-from flagscale.inference.core.diffusion.horizonkv.algorithm.attention_map import AttentionMapRecorder
-from flagscale.inference.core.diffusion.horizonkv.algorithm.baseline_selector import calculate_chunk_sparsities
 from flagscale.inference.core.diffusion.horizonkv.algorithm.config import KVSparseConfig
 from flagscale.inference.core.diffusion.horizonkv.algorithm.attention import (
     sparse_kv_self_attention,
@@ -30,14 +29,15 @@ from flagscale.inference.core.diffusion.horizonkv.algorithm.oae import (
     queue_deferred_clean_kv_to_cpu_cache,
     update_gpu_kv_cache_frames,
 )
-from flagscale.inference.core.diffusion.horizonkv.algorithm.sparse_kernels import lightforcing_attention, lightforcing_rope_apply
-from flagscale.inference.core.diffusion.horizonkv.algorithm.gpu_cache import local_lf_rope_attention
+from flagscale.inference.core.diffusion.horizonkv.algorithm.sparse_kernels import compacted_rope_apply
 
 
 # Wan 1.3B needs flex-attention autotuning for its head geometry.
 flex_attention = torch.compile(
     flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
 
+
+from .model import causal_rope_apply, CausalHead
 
 def _normalize_debug_timestep(value) -> int | None:
     if value is None:
@@ -123,37 +123,6 @@ def _minmax_pool_along_frames(
     return torch.cat(max_parts, dim=1), torch.cat(min_parts, dim=1)
 
 
-def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
-    n, c = x.size(2), x.size(3) // 2
-
-    # split freqs
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
-
-    # loop over samples
-    output = []
-
-    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
-        seq_len = f * h * w
-
-        # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
-            seq_len, n, -1, 2))
-        freqs_i = torch.cat([
-            freqs[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-            dim=-1).reshape(seq_len, 1, -1)
-
-        # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, seq_len:]])
-
-        # append to collection
-        output.append(x_i)
-    return torch.stack(output).type_as(x)
-
-
 class CausalWanSelfAttention(nn.Module):
 
     def __init__(self,
@@ -234,7 +203,7 @@ class CausalWanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
-        # HorizonKV and LightForcing apply RoPE on the compacted visible window.
+        # HorizonKV applies RoPE on the compacted visible window.
         use_compacted_window_rope = bool(self.long_video_gen) or (
             isinstance(kv_sparse_config, KVSparseConfig)
             and getattr(kv_sparse_config, "rope_semantics", "absolute")
@@ -518,291 +487,13 @@ class CausalWanSelfAttention(nn.Module):
 
                 return x
 
-            if kv_cache.get("cache_mode") == "lf_rope_local":
-                if torch.is_grad_enabled():
-                    raise RuntimeError("Local fast LF-RoPE supports no-grad inference only")
-                if cache_start != current_start:
-                    raise ValueError("Local fast LF-RoPE requires cache_start=current_start")
-                x = local_lf_rope_attention(
-                    q, k, v,
-                    kv_cache=kv_cache,
-                    cfg=kv_sparse_config,
-                    current_start=int(current_start),
-                    sink_frames=self.sink_size,
-                    num_frame_per_block=int(num_frame_per_block),
-                    layer_idx=int(debug_block_index),
-                    rope_grid_sizes=grid_sizes,
-                    rope_freqs=freqs,
-                    write_clean_kv=(
-                        bool(kv_cache_update) if kv_cache_update is not None
-                        else _is_clean_kv_update_timestep(kv_sparse_timestep)
-                    ),
-                )
-                # The local adapter commits clean KV in place. There is no
-                # deferred whole-window update for the model to apply.
-                return self.o(x.flatten(2)), None
-
-            frame_seqlen = self._cached_frame_seqlen
-            if not isinstance(frame_seqlen, int) or frame_seqlen <= 0:
-                frame_seqlen = int(math.prod(grid_sizes[0][1:].detach().cpu().tolist()))
-                self._cached_frame_seqlen = frame_seqlen
-            current_start_frame = current_start // frame_seqlen
-            if use_compacted_window_rope:
-                # Defer both rotary operations until after the visible
-                # sink/history window is assembled, as in native LightForcing.
-                roped_query = None
-                roped_key = None
-                cache_key = k
-                current_end = current_start + q.shape[1]
-                num_new_tokens = q.shape[1]
-            else:
-                roped_query = causal_rope_apply(
-                    q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
-                roped_key = causal_rope_apply(
-                    k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
-                cache_key = roped_key
-                current_end = current_start + roped_query.shape[1]
-                num_new_tokens = roped_query.shape[1]
-            sink_tokens = self.sink_size * frame_seqlen
-            # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
-            kv_cache_size = kv_cache["k"].shape[1]
-            if roped_query is not None:
-                num_new_tokens = roped_query.shape[1]
-
-            # Compute cache update parameters without modifying kv_cache directly
-            cache_update_info = None
-            is_recompute = current_end <= kv_cache["global_end_index"].item() and current_start > 0
-            if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
-                    num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
-                # Calculate the number of new tokens added in this step
-                # Shift existing cache content left to discard oldest tokens
-                num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
-                num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
-
-                # Compute updated local indices
-                local_end_index = kv_cache["local_end_index"].item() + current_end - \
-                    kv_cache["global_end_index"].item() - num_evicted_tokens
-                local_start_index = local_end_index - num_new_tokens
-
-                # Construct full k, v for attention computation (without modifying the original cache)
-                # Create temporary k, v for computation
-                temp_k = kv_cache["k"].clone()
-                temp_v = kv_cache["v"].clone()
-                
-                # Apply rolling update to the temporary cache
-                temp_k[:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                    temp_k[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                temp_v[:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                    temp_v[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                
-                # Insert new key/value into the temporary cache
-                # Protect sink_tokens only during recomputation; regular forward generation allows writing into the initial sink region
-                write_start_index = max(local_start_index, sink_tokens) if is_recompute else local_start_index
-                roped_offset = max(0, write_start_index - local_start_index)
-                write_len = max(0, local_end_index - write_start_index)
-                if write_len > 0:
-                    temp_k[:, write_start_index:local_end_index] = cache_key[:, roped_offset:roped_offset + write_len]
-                    temp_v[:, write_start_index:local_end_index] = v[:, roped_offset:roped_offset + write_len]
-
-                # Save cache update info for later use
-                cache_update_info = {
-                    "action": "roll_and_insert",
-                    "sink_tokens": sink_tokens,
-                    "num_rolled_tokens": num_rolled_tokens,
-                    "num_evicted_tokens": num_evicted_tokens,
-                    "local_start_index": local_start_index,
-                    "local_end_index": local_end_index,
-                    "write_start_index": write_start_index,
-                    "write_end_index": local_end_index,
-                    "new_k": cache_key[:, roped_offset:roped_offset + write_len],
-                    "new_v": v[:, roped_offset:roped_offset + write_len],
-                    "current_end": current_end,
-                    "is_recompute": is_recompute
-                }
-
-            else:
-                # Assign new keys/values directly up to current_end
-                local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
-                local_start_index = local_end_index - num_new_tokens
-
-                # Construct full k, v for attention computation (without modifying the original cache)
-                temp_k = kv_cache["k"].clone()
-                temp_v = kv_cache["v"].clone()
-                # Protect sink_tokens only during recomputation; regular forward generation allows writing into the initial sink region
-                write_start_index = max(local_start_index, sink_tokens) if is_recompute else local_start_index
-                if sink_recache_after_switch:
-                    write_start_index = local_start_index
-                roped_offset = max(0, write_start_index - local_start_index)
-                write_len = max(0, local_end_index - write_start_index)
-                if write_len > 0:
-                    temp_k[:, write_start_index:local_end_index] = cache_key[:, roped_offset:roped_offset + write_len]
-                    temp_v[:, write_start_index:local_end_index] = v[:, roped_offset:roped_offset + write_len]
-
-                # Save cache update info for later use
-                cache_update_info = {
-                    "action": "direct_insert",
-                    "local_start_index": local_start_index,
-                    "local_end_index": local_end_index,
-                    "write_start_index": write_start_index,
-                    "write_end_index": local_end_index,
-                    "new_k": cache_key[:, roped_offset:roped_offset + write_len],
-                    "new_v": v[:, roped_offset:roped_offset + write_len],
-                    "current_end": current_end,
-                    "is_recompute": is_recompute
-                }
-
-
-            if use_compacted_window_rope:
-                # Pack rolling history immediately after the sink.
-                kv_start = max(
-                    sink_tokens,
-                    local_end_index - self.max_attention_size + sink_tokens,
-                )
-                grid_sizes_kv = copy.deepcopy(grid_sizes)
-                grid_sizes_kv[:, 0] = (
-                    sink_tokens + (local_end_index - kv_start)
-                ) // frame_seqlen
-                q_start_frame = int(
-                    (sink_tokens + (local_end_index - kv_start) - q.shape[1])
-                    // frame_seqlen
-                )
-                if fast_lf_rope and not use_cpu_offload and use_sparse_layer:
-                    # Keep Q raw for frame selection; apply RoPE before block attention.
-                    roped_query = q.type_as(v)
-                else:
-                    roped_query = lightforcing_rope_apply(
-                        q, grid_sizes, freqs, start_frame=q_start_frame
-                    ).type_as(v)
-                k_window_unroped = torch.cat(
-                    [temp_k[:, :sink_tokens], temp_k[:, kv_start:local_end_index]],
-                    dim=1,
-                )
-                v_window = torch.cat(
-                    [temp_v[:, :sink_tokens], temp_v[:, kv_start:local_end_index]],
-                    dim=1,
-                )
-                k_window = lightforcing_rope_apply(
-                    k_window_unroped, grid_sizes_kv, freqs, start_frame=0
-                ).type_as(v)
-            else:
-                kv_start = max(0, local_end_index - self.max_attention_size)
-                k_window = temp_k[:, kv_start:local_end_index]
-                v_window = temp_v[:, kv_start:local_end_index]
-            debug_step = _normalize_debug_timestep(debug_timestep)
-
-            AttentionMapRecorder.get().record(
-                attn_type="self",
-                q=roped_query,
-                k=k_window,
-                block_index=debug_block_index,
-                timestep=debug_step,
-                current_start=current_start,
-            )
-
-            use_sparse = (
-                kv_sparse_config is not None
-                and isinstance(kv_sparse_config, KVSparseConfig)
-                and kv_sparse_config.enabled
-                and debug_block_index is not None
-                and kv_sparse_config.layer_has_sparse(debug_block_index, self.num_heads)
-            )
-            # Compacted-window sparse selection is compatible with long_video_gen.
-            config_compacted_window_rope = (
-                isinstance(kv_sparse_config, KVSparseConfig)
-                and getattr(kv_sparse_config, "rope_semantics", "absolute")
-                in {
-                    "horizonkv_compacted",
-                }
-            )
-            if (
-                use_sparse
-                and self.long_video_gen
-                and kv_sparse_config.selector != "lightforcing"
-                and not config_compacted_window_rope
-            ):
-                raise RuntimeError(
-                    "long_video_gen requires selector=lightforcing or an explicit "
-                    "compacted-window LF-RoPE configuration; use regular GPU cache "
-                    "semantics for absolute-RoPE selectors"
-                )
-            if use_sparse and self.long_video_gen and kv_sparse_config.selector == "lightforcing":
-                schedule = calculate_chunk_sparsities(
-                    int(kv_sparse_config.lightforcing_num_output_frames),
-                    int(num_frame_per_block),
-                    int(kv_sparse_config.lightforcing_local_attn_size),
-                    float(kv_sparse_config.lightforcing_sparsity),
-                    kv_sparse_config.lightforcing_sparsity_base,
-                )
-                query_chunk_frames = max(1, int(roped_query.shape[1] // frame_seqlen))
-                chunk_id = int(current_start_frame // query_chunk_frames)
-                sparsity = (
-                    schedule[min(chunk_id, len(schedule) - 1)]
-                    if schedule else float(kv_sparse_config.lightforcing_sparsity)
-                )
-                x = lightforcing_attention(
-                    roped_query,
-                    k_window,
-                    v_window,
-                    sparsity=float(sparsity),
-                    chunk_id=chunk_id,
-                    block_q=int(kv_sparse_config.attn_block_q),
-                    block_k=int(kv_sparse_config.attn_block_k),
-                    frame_seq=int(kv_sparse_config.lightforcing_frame_seq),
-                    keep_frames=int(kv_sparse_config.lightforcing_keep_frames),
-                    keep_sink=int(kv_sparse_config.lightforcing_keep_sink),
-                    keep_near=int(kv_sparse_config.lightforcing_keep_near),
-                    require_sparse=True,
-                ).to(roped_query.dtype)
-            elif use_sparse:
-                selection_query_local = (
-                    q.type_as(v) if fast_lf_rope and not use_cpu_offload else None
-                )
-                sparse_k_window = (
-                    k_window_unroped
-                    if (
-                        fast_lf_rope
-                        and not use_cpu_offload
-                        and use_sparse_layer
-                        and use_compacted_window_rope
-                    )
-                    else k_window
-                )
-                x = sparse_kv_self_attention(
-                    roped_query,
-                    sparse_k_window,
-                    v_window,
-                    frame_seqlen=frame_seqlen,
-                    kv_start=kv_start,
-                    sink_tokens=sink_tokens,
-                    current_start=int(current_start),
-                    current_end=int(current_end),
-                    local_end_index=int(local_end_index),
-                    num_frame_per_block=int(num_frame_per_block),
-                    layer_idx=int(debug_block_index),
-                    current_timestep=kv_sparse_timestep,
-                    kv_sparse_config=kv_sparse_config,
-                    out_dtype=roped_query.dtype,
-                    rope_freqs=freqs,
-                    rope_grid_sizes=grid_sizes,
-                    selection_query=selection_query_local,
-                    fast_lf_rope=fast_lf_rope and not use_cpu_offload,
-                )
-            else:
-                x = attention(
-                    roped_query,
-                    k_window,
-                    v_window
-                )
+            raise ValueError("HorizonKV requires the full host-history KV cache")
 
         # output
         x = x.flatten(2)
         x = self.o(x)
-        
-        # Return both output and cache update info
-        if kv_cache is not None:
-            return x, (current_end, local_end_index, cache_update_info)
-        else:
-            return x
+
+        return x
 
 
 class CausalWanAttentionBlock(nn.Module):
@@ -938,7 +629,7 @@ class CausalWanAttentionBlock(nn.Module):
             return x
 
         x = cross_attn_ffn(x, context, context_lens, e, crossattn_cache)
-        
+
         if cache_update_info is not None:
             # cache_update_info is already in the format (current_end, local_end_index, cache_update_info)
             return x, cache_update_info
@@ -946,36 +637,7 @@ class CausalWanAttentionBlock(nn.Module):
             return x
 
 
-class CausalHead(nn.Module):
-
-    def __init__(self, dim, out_dim, patch_size, eps=1e-6):
-        super().__init__()
-        self.dim = dim
-        self.out_dim = out_dim
-        self.patch_size = patch_size
-        self.eps = eps
-
-        # layers
-        out_dim = math.prod(patch_size) * out_dim
-        self.norm = WanLayerNorm(dim, eps)
-        self.head = nn.Linear(dim, out_dim)
-
-        # modulation
-        self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
-
-    def forward(self, x, e):
-        r"""
-        Args:
-            x(Tensor): Shape [B, L1, C]
-            e(Tensor): Shape [B, F, 1, C]
-        """
-        num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
-        e = (self.modulation.unsqueeze(1) + e).chunk(2, dim=2)
-        x = (self.head(self.norm(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]))
-        return x
-
-
-class CausalWanModel(ModelMixin, ConfigMixin):
+class CausalWanModel(WanModel):
     r"""
     Wan diffusion backbone supporting both text-to-video and image-to-video.
     """
@@ -1043,7 +705,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 Epsilon value for normalization layers
         """
 
-        super().__init__()
+        ModelMixin.__init__(self)
 
         assert model_type in ['t2v', 'i2v']
         self.model_type = model_type
@@ -1112,9 +774,6 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.independent_first_frame = False
         self.kv_sparse_config = None
 
-    def _set_gradient_checkpointing(self, module, value=False):
-        self.gradient_checkpointing = value
-
 
     def _apply_cache_updates(self, kv_cache, cache_update_infos):
         """
@@ -1126,7 +785,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         for block_index, (current_end, local_end_index, update_info) in cache_update_infos:
             if update_info is not None:
                 cache = kv_cache[block_index]
-                
+
                 if update_info["action"] == "roll_and_insert":
                     # Apply rolling update
                     sink_tokens = update_info["sink_tokens"]
@@ -1138,18 +797,18 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     write_end_index = update_info.get("write_end_index", local_end_index)
                     new_k = update_info["new_k"]
                     new_v = update_info["new_v"]
-                    
+
                     # Perform the rolling operation
                     cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
                         cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
                     cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
                         cache["v"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                    
+
                     # Insert new key/value
                     if write_end_index > write_start_index and new_k.shape[1] == (write_end_index - write_start_index):
                         cache["k"][:, write_start_index:write_end_index] = new_k
                         cache["v"][:, write_start_index:write_end_index] = new_v
-                    
+
                 elif update_info["action"] == "direct_insert":
                     # Direct insert
                     local_start_index = update_info["local_start_index"]
@@ -1158,12 +817,12 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     write_end_index = update_info.get("write_end_index", local_end_index)
                     new_k = update_info["new_k"]
                     new_v = update_info["new_v"]
-                    
+
                     # Insert new key/value
                     if write_end_index > write_start_index and new_k.shape[1] == (write_end_index - write_start_index):
                         cache["k"][:, write_start_index:write_end_index] = new_k
                         cache["v"][:, write_start_index:write_end_index] = new_v
-            
+
             # Update indices: do not roll back pointers during recomputation
             is_recompute = False if update_info is None else update_info.get("is_recompute", False)
             if not is_recompute:
@@ -1219,7 +878,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
-        
+
 
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
@@ -1347,52 +1006,3 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             return self._forward_inference(*args, **kwargs)
         else:
             return self._forward_train(*args, **kwargs)
-
-    def unpatchify(self, x, grid_sizes):
-        r"""
-        Reconstruct video tensors from patch embeddings.
-
-        Args:
-            x (List[Tensor]):
-                List of patchified features, each with shape [L, C_out * prod(patch_size)]
-            grid_sizes (Tensor):
-                Original spatial-temporal grid dimensions before patching,
-                    shape [B, 3] (3 dimensions correspond to F_patches, H_patches, W_patches)
-
-        Returns:
-            List[Tensor]:
-                Reconstructed video tensors with shape [C_out, F, H / 8, W / 8]
-        """
-
-        c = self.out_dim
-        out = []
-        for u, v in zip(x, grid_sizes.tolist()):
-            u = u[:math.prod(v)].view(*v, *self.patch_size, c)
-            u = torch.einsum('fhwpqrc->cfphqwr', u)
-            u = u.reshape(c, *[i * j for i, j in zip(v, self.patch_size)])
-            out.append(u)
-        return out
-
-    def init_weights(self):
-        r"""
-        Initialize model parameters using Xavier initialization.
-        """
-
-        # basic init
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-        # init embeddings
-        nn.init.xavier_uniform_(self.patch_embedding.weight.flatten(1))
-        for m in self.text_embedding.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=.02)
-        for m in self.time_embedding.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=.02)
-
-        # init output layer
-        nn.init.zeros_(self.head.head.weight)

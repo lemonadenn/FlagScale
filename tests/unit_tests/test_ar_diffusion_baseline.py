@@ -14,7 +14,7 @@ from omegaconf import OmegaConf
 
 @pytest.fixture
 def session_methods(monkeypatch):
-    from flagscale.inference.core.diffusion import causal_inference as native
+    from flagscale.inference.core.diffusion.horizonkv import baseline_session as native
 
     encode = Mock()
     monkeypatch.setattr(native, "encode_video_latent", encode)
@@ -153,16 +153,16 @@ def test_comparison_configs_keep_independent_attention_algorithms():
 
 @pytest.mark.parametrize("context", [0, -3, 1, 4, 6.0, True])
 def test_invalid_context_rejected_before_runtime_side_effects(context):
-    from flagscale.inference.core.diffusion.ar_diffusion_pipeline import ARDiffusionRuntime
+    from flagscale.inference.core.diffusion.horizonkv.baseline import ARDiffusionRuntime
 
     with pytest.raises(ValueError, match="positive multiple of 3"):
         ARDiffusionRuntime("/missing", "/missing", context)
 
 
 def test_ar_diffusion_five_step_shift_matches_original_schedule():
-    from flagscale.inference.core.diffusion.ar_diffusion_model_spec import denoising_steps
+    from flagscale.inference.core.diffusion.horizonkv.model_spec import denoising_steps
 
-    from flagscale.inference.core.diffusion.ar_diffusion import scheduler as scheduler_module
+    from flagscale.inference.core.diffusion.horizonkv.wan import scheduler as scheduler_module
 
     scheduler = scheduler_module.FlowMatchScheduler(shift=5, sigma_min=0, extra_one_step=True)
     scheduler.set_timesteps(1000, training=True)

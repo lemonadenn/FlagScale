@@ -3,9 +3,9 @@
 The modules are intentionally grouped by responsibility:
 
 * ``config`` and ``rasa_policy`` validate static and adaptive policies;
-* ``oae``, ``gpu_cache`` and ``transfer`` implement KV residency/offload;
+* ``oae`` and ``transfer`` implement KV residency/offload;
 * ``attention`` and ``sparse_backend`` run sparse attention;
-* ``pipeline`` and ``backbone`` provide the model-independent AR loop.
+* ``pipeline`` provides the AR loop over the shared ``wan.backbone``.
 
 Importing this package does not build or load a CUDA extension.
 """

@@ -18,7 +18,7 @@ class HorizonKVTransformation(Transformation):
             from flagscale.inference.core.diffusion.horizonkv.algorithm.config import (
                 attach_kv_sparse_to_model,
             )
-            from flagscale.inference.core.diffusion.horizonkv.wan.modules.causal_model import (
+            from flagscale.inference.core.diffusion.horizonkv.wan.causal_model import (
                 CausalWanModel,
             )
 

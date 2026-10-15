@@ -11,16 +11,12 @@ from typing import List
 import torch
 import torch.distributed as dist
 
-from flagscale.inference.core.diffusion.horizonkv.algorithm.backbone import (
+from flagscale.inference.core.diffusion.horizonkv.wan.backbone import (
     WanDiffusionWrapper,
     WanTextEncoder,
     WanVAEWrapper,
 )
 from flagscale.inference.core.diffusion.horizonkv.algorithm.config import attach_kv_sparse_to_model
-from flagscale.inference.core.diffusion.horizonkv.algorithm.gpu_cache import (
-    build_local_kv_cache_state,
-    uses_fast_lf_rope_local,
-)
 from flagscale.inference.core.diffusion.horizonkv.algorithm.memory import (
     get_cuda_free_memory_gb,
     gpu,
@@ -366,8 +362,6 @@ class CausalInferencePipeline(torch.nn.Module):
             int(max_kv_frames),
             granularity,
         )
-        if uses_fast_lf_rope_local(kv_sparse_config):
-            signature += ("lf_rope_local",)
         if self.kv_cache1 is not None and self._kv_cache_signature == signature:
             for cache in self.kv_cache1:
                 reset_kv_cache_state(cache)
@@ -437,42 +431,7 @@ class CausalInferencePipeline(torch.nn.Module):
             self.kv_cache1 = kv_cache1
             return
 
-        if kv_cache_size_override is not None:
-            kv_cache_size = kv_cache_size_override
-        else:
-            if self.local_attn_size != -1:
-                kv_cache_size = self.local_attn_size * self.frame_seq_length
-            else:
-                # Preserve the base model's 21-frame global cache default.
-                kv_cache_size = 32760
-
-        for layer_idx in range(self.num_transformer_blocks):
-            if (
-                uses_fast_lf_rope_local(kv_sparse_config)
-                and kv_sparse_config.layer_has_sparse(layer_idx, num_heads)
-            ):
-                if kv_cache_size % self.frame_seq_length:
-                    raise ValueError("Local LF-RoPE cache must contain complete frames")
-                kv_cache1.append(build_local_kv_cache_state(
-                    batch_size=batch_size,
-                    dtype=dtype,
-                    device=device,
-                    frame_capacity=kv_cache_size // self.frame_seq_length,
-                    frame_seqlen=self.frame_seq_length,
-                    num_heads=num_heads,
-                    head_dim=head_dim,
-                ))
-                continue
-            shape = (batch_size, kv_cache_size, num_heads, head_dim)
-            kv_cache1.append({
-                "k": torch.zeros(shape, dtype=dtype, device=device),
-                "v": torch.zeros(shape, dtype=dtype, device=device),
-                "frame_seqlen": int(self.frame_seq_length),
-                "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
-            })
-
-        self.kv_cache1 = kv_cache1  # always store the clean cache
+        raise ValueError("HorizonKV requires cpu_offload_kv=true")
 
     def _initialize_crossattn_cache(self, batch_size, dtype, device):
         """

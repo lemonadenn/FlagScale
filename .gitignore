@@ -42,3 +42,8 @@ CLAUDE.md
 
 tests/unit_tests/test_horizonkv_service_benchmark.py
 tests/unit_tests/test_vbenchlong_suite.py
+
+# Local evaluation and unrelated diffusion experiments.
+/examples/horizonkv/**/vbenchlong*
+/examples/horizonkv/**/vbench_long*
+/flagscale/inference/core/diffusion/adaspa/

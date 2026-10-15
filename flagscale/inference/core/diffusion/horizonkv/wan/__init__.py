@@ -1,1 +1,1 @@
-"""Wan model components used by the HorizonKV causal backbone."""
+"""Wan model components shared by HorizonKV and its dense AR baseline."""

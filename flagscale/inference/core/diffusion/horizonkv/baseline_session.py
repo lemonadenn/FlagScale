@@ -1,4 +1,4 @@
-# Adapted from Krea realtime-video; see ar_diffusion/NOTICE and LICENSE.md.
+# Adapted from Krea realtime-video; see NOTICE and licenses/CC-BY-NC-SA-4.0.md.
 from __future__ import annotations
 
 from collections import deque
@@ -8,7 +8,7 @@ import logging
 
 import torch
 
-from .ar_diffusion.scheduler import FlowMatchScheduler
+from .wan.scheduler import FlowMatchScheduler
 
 LOGGER = logging.getLogger(__name__)
 

@@ -8,7 +8,7 @@ engine:
   model: ${experiment.model}
   loader: diffusers
   pipeline:
-    class: flagscale.inference.core.diffusion.ar_diffusion_pipeline.ARDiffusionPipeline
+    class: flagscale.inference.core.diffusion.horizonkv.baseline.ARDiffusionPipeline
     from_pretrained:
       checkpoint: ${oc.env:KREA_CHECKPOINT,./models/horizonkv/checkpoints/krea/krea-realtime-video-14b.safetensors}
       torch_dtype: bfloat16

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """FlagScale adapter for the locally migrated Krea dense GenerationSession.
 
-Model and session sources are bundled here; see ar_diffusion/NOTICE.
+Model and session sources are bundled here; see NOTICE.
 """
 
 import hashlib
@@ -13,7 +13,6 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from .ar_diffusion_model_spec import model_config, validate_krea_checkpoint
 
 __all__ = ["ARDiffusionOutput", "ARDiffusionRuntime", "ARDiffusionPipeline"]
 
@@ -40,8 +39,10 @@ class ARDiffusionRuntime:
 
     def snapshot(self):
         root = Path(__file__).resolve().parent
-        files = [root / "ar_diffusion_pipeline.py", root / "causal_inference.py", root / "causal_vae.py"]
-        files += sorted((root / "ar_diffusion").glob("*.py"))
+        files = [root / name for name in (
+            "baseline.py", "baseline_session.py", "streaming_vae.py", "model_spec.py"
+        )]
+        files += sorted((root / "wan").glob("*.py"))
         return dict(
             sampling_profile=("krea-default-session-five-step-v1" if self.context_latent_frames == 3
                               else f"krea-session-context{self.context_latent_frames}-five-step-v1"),
@@ -67,24 +68,14 @@ class ARDiffusionRuntime:
 
 def load_local_transformer(checkpoint):
     """Construct the original upstream class without first loading teacher weights."""
-    from accelerate import init_empty_weights
-    from safetensors import safe_open
-    from .ar_diffusion.scheduler import FlowMatchScheduler
-    from .ar_diffusion.backbone import WanDiffusionWrapper
-    from .ar_diffusion.causal_model import CausalWanModel
+    from .wan.scheduler import FlowMatchScheduler
+    from .wan.backbone import DenseWanDiffusionWrapper as WanDiffusionWrapper
+    from .wan.baseline_causal_model import CausalWanModel
+    from .wan.loading import load_krea_model
 
-    validate_krea_checkpoint(checkpoint)
-    with init_empty_weights():
-        model = CausalWanModel(**model_config("krea-14b"), local_attn_size=-1, sink_size=0)
-    expected = model.state_dict()
-    with safe_open(str(checkpoint), framework="pt", device="cpu") as tensors:
-        if set(tensors.keys()) != {f"model.{key}" for key in expected}:
-            raise ValueError("Krea checkpoint keys do not match the upstream model")
-        for key, value in expected.items():
-            if tuple(tensors.get_slice(f"model.{key}").get_shape()) != tuple(value.shape):
-                raise ValueError(f"Krea checkpoint shape mismatch: {key}")
-        weights = {key: tensors.get_tensor(f"model.{key}").to(torch.bfloat16) for key in expected}
-    model.load_state_dict(weights, strict=True, assign=True)
+    model = load_krea_model(
+        checkpoint, CausalWanModel, dtype=torch.bfloat16, local_attn_size=-1, sink_size=0,
+    )
     wrapper = WanDiffusionWrapper.__new__(WanDiffusionWrapper)
     nn.Module.__init__(wrapper)
     wrapper.model = model
@@ -100,9 +91,9 @@ def load_local_transformer(checkpoint):
 
 def load_local_text_encoder(assets):
     from accelerate import init_empty_weights
-    from .ar_diffusion.backbone import WanTextEncoder
-    from .ar_diffusion.t5 import umt5_xxl
-    from .ar_diffusion.tokenizers import HuggingfaceTokenizer
+    from .wan.backbone import WanTextEncoder
+    from .wan.t5 import umt5_xxl
+    from .wan.tokenizers import HuggingfaceTokenizer
 
     root = assets / "wan_models/Wan2.1-T2V-1.3B"
     encoder = WanTextEncoder.__new__(WanTextEncoder)
@@ -126,8 +117,8 @@ def load_local_text_encoder(assets):
 
 def load_local_streaming_vae(assets):
     """Preserve the original FP16 block-3 decoder and boundary encoder."""
-    from .causal_vae import VAEEncoderWrapper, VAEDecoderWrapper
-    from .ar_diffusion.vae import WanVAE
+    from .streaming_vae import VAEEncoderWrapper, VAEDecoderWrapper
+    from .wan.baseline_vae import WanVAE
 
     path = assets / "wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth"
     vae = WanVAE(vae_pth=str(path), dtype=torch.float16)
@@ -177,7 +168,7 @@ class ARDiffusionPipeline(nn.Module):
         try:
             if not torch.cuda.is_available():
                 raise RuntimeError("AR+Diffusion baseline requires CUDA")
-            from .causal_inference import CausalInferencePipeline
+            from .baseline_session import CausalInferencePipeline
 
             transformer = load_local_transformer(runtime.checkpoint)
             text_encoder = load_local_text_encoder(runtime.assets)
@@ -217,7 +208,7 @@ class ARDiffusionPipeline(nn.Module):
         if output_type not in ("np", "latent"):
             raise ValueError("output_type must be np or latent")
         seed = generator.initial_seed() if generator is not None else 42
-        from .causal_inference import GenerateParams, GenerationSession
+        from .baseline_session import GenerateParams, GenerationSession
 
         params = GenerateParams(
             prompt=prompt,

@@ -15,11 +15,11 @@ import torch
 
 from flagscale.inference.core.diffusion.horizonkv.algorithm.config import KVSparseConfig
 from flagscale.inference.core.diffusion.horizonkv.algorithm.retrieval import _per_frame_simple_mean_cached_k, _select_kv_frame_indices_weighted_random_batched
-from flagscale.inference.core.diffusion.horizonkv.wan.modules.attention import attention
+from flagscale.inference.core.diffusion.horizonkv.wan.attention import attention
 from flagscale.inference.core.diffusion.horizonkv.algorithm.sparse_kernels import (
-    lightforcing_rope_apply,
-    lightforcing_rope_apply_compact,
-    lightforcing_rope_apply_packed_rows,
+    compacted_rope_apply,
+    compacted_rope_apply_compact,
+    compacted_rope_apply_packed_rows,
 )
 
 try:
@@ -57,15 +57,11 @@ except Exception:
 try:
     from flagscale.inference.core.diffusion.horizonkv.algorithm.triton_kernels import (
         blocksparse_attention_pooled_triton,
-        cache_direct_attention_triton,
-        cache_direct_attention_triton_stats,
         merge_attention_lse_parts_triton,
         merge_attention_parts_triton,
     )
 except Exception:
     blocksparse_attention_pooled_triton = None
-    cache_direct_attention_triton = None
-    cache_direct_attention_triton_stats = None
     merge_attention_lse_parts_triton = None
     merge_attention_parts_triton = None
 
@@ -3059,7 +3055,7 @@ def _apply_fast_lf_rope_to_compact_k(
         return None
     if int(rope_grid_sizes.ndim) != 2 or int(rope_grid_sizes.shape[0]) != batch_size:
         return None
-    compact_rope = lightforcing_rope_apply_compact(
+    compact_rope = compacted_rope_apply_compact(
         k_compact,
         num_heads=num_heads,
         selected_frames=selected_frames,
@@ -3076,7 +3072,7 @@ def _apply_fast_lf_rope_to_compact_k(
     # the native [B, T, H, D] layout, so only views/permutes are needed here.
     k_blhd = k_compact.reshape(batch_size, num_heads, token_count, head_dim)
     k_blhd = k_blhd.permute(0, 2, 1, 3).contiguous()
-    k_blhd = lightforcing_rope_apply(
+    k_blhd = compacted_rope_apply(
         k_blhd,
         grid_sizes_kv,
         rope_freqs,
@@ -3153,7 +3149,7 @@ def _apply_fast_lf_rope_to_row_materialized_k(
     )
     if int(frame_positions.shape[0]) != expected_rows or int(row_lens.numel()) != expected_rows:
         return None
-    return lightforcing_rope_apply_packed_rows(
+    return compacted_rope_apply_packed_rows(
         k_compact,
         frame_positions,
         row_lens,
@@ -5753,7 +5749,6 @@ def _sparse_kv_self_attention_cpu_offload(
             cfg.granularity == "kv_frame"
             and cfg.max_kv_frames > int(n_frames)
             and not fast_lf_rope
-            and not (cfg.visualize_attn_mask and cfg.visualize_output_dir)
         ):
             dense_out = _dense_attention_all_frames(
                 kv_cache,
@@ -5877,7 +5872,7 @@ def _sparse_kv_self_attention_cpu_offload(
                         0,
                         current_start_frame - max(0, selected_frames - query_frames),
                     )
-                    q_for_attention = lightforcing_rope_apply(
+                    q_for_attention = compacted_rope_apply(
                         roped_query,
                         rope_grid_sizes,
                         rope_freqs,

@@ -1,6 +1,7 @@
-# Adapted from Krea realtime-video; see NOTICE and LICENSE.md.
+# Modified for the HorizonKV inference artifact; see NOTICE.
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import torch
+
 try:
     import flash_attn_interface
 
@@ -11,7 +12,6 @@ try:
         return "h100" in device_name or "hopper" in device_name
     FLASH_ATTN_3_AVAILABLE = is_hopper_gpu()
 except ModuleNotFoundError:
-    flash_attn_interface = None
     FLASH_ATTN_3_AVAILABLE = False
 
 try:
@@ -20,16 +20,14 @@ try:
 except ModuleNotFoundError:
     FLASH_ATTN_2_AVAILABLE = False
 
-from .sage import sageattn_func, SAGEATTN_AVAILABLE
 
 import warnings
 
 __all__ = [
     'flash_attention',
     'attention',
-    'sageattn_func',
-    'SAGEATTN_AVAILABLE',
 ]
+
 
 def flash_attention(
     q,
@@ -45,6 +43,7 @@ def flash_attention(
     deterministic=False,
     dtype=torch.bfloat16,
     version=None,
+    _fa3_unwrap=True,
 ):
     """
     q:              [B, Lq, Nq, C1].
@@ -59,15 +58,6 @@ def flash_attention(
     deterministic:  bool. If True, slightly slower and uses more memory.
     dtype:          torch.dtype. Apply when dtype of q/k/v is not float16/bfloat16.
     """
-    if not FLASH_ATTN_3_AVAILABLE:
-        # FlashAttention 2 exposes the dense API from the package module. The
-        # previous migration imported FA3 and FA2 together, so a missing FA3
-        # interface left ``flash_attn_func`` undefined even when FA2 existed.
-        return flash_attn.flash_attn_func(
-            q,
-            k,
-            v,
-        )
     half_dtypes = (torch.float16, torch.bfloat16)
     assert dtype in half_dtypes
     assert q.device.type == 'cuda' and q.size(-1) <= 256
@@ -124,7 +114,10 @@ def flash_attention(
             max_seqlen_k=lk,
             softmax_scale=softmax_scale,
             causal=causal,
-            deterministic=deterministic).unflatten(0, (b, lq))
+            deterministic=deterministic)
+        if _fa3_unwrap:
+            x = x[0]
+        x = x.unflatten(0, (b, lq))
     else:
         assert FLASH_ATTN_2_AVAILABLE
         x = flash_attn.flash_attn_varlen_func(
@@ -148,9 +141,9 @@ def flash_attention(
 
 
 def attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    q,
+    k,
+    v,
     q_lens=None,
     k_lens=None,
     dropout_p=0.,
@@ -161,24 +154,8 @@ def attention(
     deterministic=False,
     dtype=torch.bfloat16,
     fa_version=None,
-    # og_dtype=torch.bfloat16,
 ):
-    if SAGEATTN_AVAILABLE:
-        # print("Using sageattention")
-        attn_mask = None
-
-        og_dtype = q.dtype
-        q = q.transpose(1, 2).to(dtype)
-        k = k.transpose(1, 2).to(dtype)
-        v = v.transpose(1, 2).to(dtype)
-
-        out = sageattn_func(
-            q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
-
-        out = out.transpose(1, 2).contiguous().to(og_dtype)
-        return out
-    
-    elif FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE:
+    if FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE:
         return flash_attention(
             q=q,
             k=k,
@@ -210,3 +187,87 @@ def attention(
 
         out = out.transpose(1, 2).contiguous()
         return out
+
+
+def baseline_flash_attention(
+    q,
+    k,
+    v,
+    q_lens=None,
+    k_lens=None,
+    dropout_p=0.,
+    softmax_scale=None,
+    q_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    deterministic=False,
+    dtype=torch.bfloat16,
+    version=None,
+):
+    """Krea baseline attention, preserving its unmasked FA2 dense call."""
+    if not FLASH_ATTN_3_AVAILABLE:
+        return flash_attn.flash_attn_func(q, k, v)
+    return flash_attention(
+        q, k, v, q_lens=q_lens, k_lens=k_lens, dropout_p=dropout_p,
+        softmax_scale=softmax_scale, q_scale=q_scale, causal=causal,
+        window_size=window_size, deterministic=deterministic, dtype=dtype,
+        version=version, _fa3_unwrap=False,
+    )
+
+
+def baseline_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_lens=None,
+    k_lens=None,
+    dropout_p=0.,
+    softmax_scale=None,
+    q_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    deterministic=False,
+    dtype=torch.bfloat16,
+    fa_version=None,
+    # og_dtype=torch.bfloat16,
+):
+    from .sage import SAGEATTN_AVAILABLE, sageattn_func
+
+    if SAGEATTN_AVAILABLE:
+        # print("Using sageattention")
+        attn_mask = None
+
+        og_dtype = q.dtype
+        q = q.transpose(1, 2).to(dtype)
+        k = k.transpose(1, 2).to(dtype)
+        v = v.transpose(1, 2).to(dtype)
+
+        out = sageattn_func(
+            q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
+
+        out = out.transpose(1, 2).contiguous().to(og_dtype)
+        return out
+
+    elif FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE:
+        return baseline_flash_attention(
+            q=q,
+            k=k,
+            v=v,
+            q_lens=q_lens,
+            k_lens=k_lens,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            q_scale=q_scale,
+            causal=causal,
+            window_size=window_size,
+            deterministic=deterministic,
+            dtype=dtype,
+            version=fa_version,
+        )
+    else:
+        return attention(
+            q, k, v, q_lens=q_lens, k_lens=k_lens, dropout_p=dropout_p,
+            softmax_scale=softmax_scale, q_scale=q_scale, causal=causal,
+            window_size=window_size, deterministic=deterministic, dtype=dtype,
+            fa_version=fa_version,
+        )

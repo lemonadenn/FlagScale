@@ -21,11 +21,6 @@ def _plan_enabled_by_env() -> bool:
     return value not in ("0", "false", "no", "off", "disable", "disabled")
 
 
-def _zero_copy_onload_enabled_by_env() -> bool:
-    value = str(os.getenv("HORIZONKV_ZERO_COPY_ONLOAD", "0")).strip().lower()
-    return value not in ("0", "false", "no", "off", "disable", "disabled")
-
-
 def _batched_h2d_enabled_by_env() -> bool:
     value = str(os.getenv("HORIZONKV_BATCHED_H2D", "0")).strip().lower()
     return value not in ("0", "false", "no", "off", "disable", "disabled")
@@ -37,56 +32,6 @@ def _batched_h2d_min_copy_items_by_env() -> int:
         return max(1, int(raw))
     except Exception:
         return 8
-
-
-def _env_bool_if_set(name: str) -> bool | None:
-    value = os.getenv(name, None)
-    if value is None:
-        return None
-    return str(value).strip().lower() not in ("0", "false", "no", "off", "disable", "disabled")
-
-
-def _zero_copy_onload_auto_enabled_by_env() -> bool:
-    value = str(os.getenv("HORIZONKV_ZERO_COPY_ONLOAD_AUTO", "1")).strip().lower()
-    return value not in ("0", "false", "no", "off", "disable", "disabled")
-
-
-def _zero_copy_onload_min_copy_items_by_env() -> int:
-    raw = str(os.getenv("HORIZONKV_ZERO_COPY_ONLOAD_MIN_COPIES", "32")).strip()
-    try:
-        return max(0, int(raw))
-    except Exception:
-        return 32
-
-
-def _zero_copy_onload_min_bytes_by_env() -> int:
-    raw = str(os.getenv("HORIZONKV_ZERO_COPY_ONLOAD_MIN_BYTES", "1048576")).strip()
-    try:
-        return max(0, int(raw))
-    except Exception:
-        return 1048576
-
-
-def _zero_copy_onload_worthwhile(
-    *,
-    copy_count: int,
-    batch_size: int,
-    frame_seqlen: int,
-    head_dim: int,
-    elem_size: int,
-) -> bool:
-    copy_count = max(0, int(copy_count))
-    if copy_count < _zero_copy_onload_min_copy_items_by_env():
-        return False
-    bytes_to_copy = (
-        copy_count
-        * max(1, int(batch_size))
-        * max(1, int(frame_seqlen))
-        * max(1, int(head_dim))
-        * max(1, int(elem_size))
-        * 2
-    )
-    return bytes_to_copy >= _zero_copy_onload_min_bytes_by_env()
 
 
 def _cpu_cache_is_head_major(
@@ -236,49 +181,6 @@ def fused_kv_frame_materialize_varlen(
     return True
 
 
-def cache_direct_attention(
-    *,
-    q: torch.Tensor,
-    gpu_k: torch.Tensor,
-    gpu_v: torch.Tensor,
-    head_indices: torch.Tensor,
-    frame_indices: torch.Tensor,
-    slot_indices: torch.Tensor,
-    frame_seqlen: int,
-    total_tokens: int,
-    num_heads: int,
-    gpu_cache_frames: int,
-    live_k: torch.Tensor | None = None,
-    live_v: torch.Tensor | None = None,
-    live_start_index: int = 0,
-    softmax_scale: float | None = None,
-) -> torch.Tensor | None:
-    """Run sparse attention directly from GPU slot cache/live KV without materializing K/V."""
-    module = _load_module()
-    if module is None or not hasattr(module, "kv_sparse_cache_direct_attention"):
-        return None
-    device = q.device
-    empty_live = torch.empty(0, device=device, dtype=q.dtype)
-    has_live = live_k is not None and live_v is not None
-    return module.kv_sparse_cache_direct_attention(
-        q,
-        gpu_k,
-        gpu_v,
-        head_indices,
-        frame_indices,
-        slot_indices,
-        live_k if has_live else empty_live,
-        live_v if has_live else empty_live,
-        int(frame_seqlen),
-        int(total_tokens),
-        int(num_heads),
-        int(gpu_cache_frames),
-        int(live_start_index),
-        bool(has_live),
-        float(softmax_scale) if softmax_scale is not None else -1.0,
-    )
-
-
 def select_pooled_qk_topk(
     *,
     q: torch.Tensor,
@@ -358,68 +260,6 @@ def update_frame_slot_map(
     return True
 
 
-def copy_kv_frame_to_gpu_slot(
-    *,
-    cpu_k: torch.Tensor,
-    cpu_v: torch.Tensor,
-    gpu_k: torch.Tensor,
-    gpu_v: torch.Tensor,
-    head_id: int,
-    frame_id: int,
-    slot: int,
-    frame_seqlen: int,
-    gpu_cache_frames: int,
-) -> int:
-    """Copy one miss frame/head from pinned CPU cache to a GPU cache slot."""
-    module = _load_module()
-    if module is None or not hasattr(module, "kv_sparse_copy_frame_to_slot"):
-        return 0
-    return int(
-        module.kv_sparse_copy_frame_to_slot(
-            cpu_k,
-            cpu_v,
-            gpu_k,
-            gpu_v,
-            int(head_id),
-            int(frame_id),
-            int(slot),
-            int(frame_seqlen),
-            int(gpu_cache_frames),
-        )
-    )
-
-
-def copy_kv_frames_to_gpu_slots(
-    *,
-    cpu_k: torch.Tensor,
-    cpu_v: torch.Tensor,
-    gpu_k: torch.Tensor,
-    gpu_v: torch.Tensor,
-    head_ids: torch.Tensor,
-    frame_ids: torch.Tensor,
-    slot_ids: torch.Tensor,
-    frame_seqlen: int,
-    gpu_cache_frames: int,
-) -> int:
-    """Copy multiple miss frame/head items from pinned CPU cache to GPU slots."""
-    module = _load_module()
-    if module is None or not hasattr(module, "kv_sparse_copy_frames_to_slots"):
-        return 0
-    return int(
-        module.kv_sparse_copy_frames_to_slots(
-            cpu_k,
-            cpu_v,
-            gpu_k,
-            gpu_v,
-            head_ids,
-            frame_ids,
-            slot_ids,
-            int(frame_seqlen),
-            int(gpu_cache_frames),
-        )
-    )
-
-
 def copy_kv_frame_plan_to_gpu_slots(
     *,
     cpu_k: torch.Tensor,
@@ -432,69 +272,11 @@ def copy_kv_frame_plan_to_gpu_slots(
     frame_seqlen: int,
     gpu_cache_frames: int,
 ) -> int:
-    """Copy miss frames from a dense [head, selected-frame] CPU plan to GPU slots."""
+    """Copy miss frames from a CPU frame plan into GPU slots."""
     module = _load_module()
     if module is None or not hasattr(module, "kv_sparse_copy_frame_plan_to_slots"):
         return 0
-    force_zero_copy = _env_bool_if_set("HORIZONKV_ZERO_COPY_ONLOAD")
-    copy_count = int(copy_plan.ne(0).sum().item())
-    head_major = _cpu_cache_is_head_major(
-        cpu_k, gpu_k, frame_seqlen=frame_seqlen, gpu_cache_frames=gpu_cache_frames
-    )
-    use_zero_copy = False if head_major else (
-        bool(force_zero_copy) if force_zero_copy is not None else (
-            _zero_copy_onload_auto_enabled_by_env()
-            and _zero_copy_onload_worthwhile(
-                copy_count=copy_count,
-                batch_size=int(cpu_k.shape[0]) if cpu_k.ndim >= 1 else 1,
-                frame_seqlen=int(frame_seqlen),
-                head_dim=int(cpu_k.shape[-1]) if cpu_k.ndim >= 1 else 1,
-                elem_size=int(cpu_k.element_size()),
-            )
-        )
-    )
-    if use_zero_copy and hasattr(module, "kv_sparse_copy_frame_plan_to_slots_zero_copy"):
-        try:
-            if copy_count > 0:
-                device = gpu_k.device
-                copied = int(
-                    module.kv_sparse_copy_frame_plan_to_slots_zero_copy(
-                        cpu_k,
-                        cpu_v,
-                        gpu_k,
-                        gpu_v,
-                        frame_indices.to(device=device, dtype=torch.long, non_blocking=True).contiguous(),
-                        slot_plan.to(device=device, dtype=torch.long, non_blocking=True).contiguous(),
-                        copy_plan.to(device=device, dtype=torch.long, non_blocking=True).contiguous(),
-                        int(frame_seqlen),
-                        int(gpu_cache_frames),
-                        copy_count,
-                    )
-                )
-                if copied == copy_count:
-                    return copied
-        except Exception as exc:
-            verbose = str(os.getenv("HORIZONKV_FUSED_ONLOAD_VERBOSE", "0")).strip().lower() in (
-                "1",
-                "true",
-                "yes",
-                "on",
-            )
-            if verbose:
-                print(f"[horizonkv] dense zero-copy onload fallback after failure: {exc}")
-    return int(
-        module.kv_sparse_copy_frame_plan_to_slots(
-            cpu_k,
-            cpu_v,
-            gpu_k,
-            gpu_v,
-            frame_indices,
-            slot_plan,
-            copy_plan,
-            int(frame_seqlen),
-            int(gpu_cache_frames),
-        )
-    )
+    return int(module.kv_sparse_copy_frame_plan_to_slots(cpu_k, cpu_v, gpu_k, gpu_v, frame_indices, slot_plan, copy_plan, int(frame_seqlen), int(gpu_cache_frames)))
 
 
 def copy_kv_frame_plan_to_gpu_slots_batched(
@@ -537,122 +319,6 @@ def copy_kv_frame_plan_to_gpu_slots_batched(
     )
 
 
-def copy_kv_frames_to_gpu_slots_zero_copy(
-    *,
-    cpu_k: torch.Tensor,
-    cpu_v: torch.Tensor,
-    gpu_k: torch.Tensor,
-    gpu_v: torch.Tensor,
-    head_ids: torch.Tensor,
-    frame_ids: torch.Tensor,
-    slot_ids: torch.Tensor,
-    frame_seqlen: int,
-    gpu_cache_frames: int,
-) -> int:
-    """Experimental mapped-pinned CPU KV -> GPU slot copy using one CUDA kernel."""
-    if not _zero_copy_onload_enabled_by_env():
-        return 0
-    module = _load_module()
-    if module is None or not hasattr(module, "kv_sparse_copy_frames_to_slots_zero_copy"):
-        return 0
-    return int(
-        module.kv_sparse_copy_frames_to_slots_zero_copy(
-            cpu_k,
-            cpu_v,
-            gpu_k,
-            gpu_v,
-            head_ids,
-            frame_ids,
-            slot_ids,
-            int(frame_seqlen),
-            int(gpu_cache_frames),
-        )
-    )
-
-
-def pack_kv_frames_to_pinned_staging(
-    *,
-    cpu_k: torch.Tensor,
-    cpu_v: torch.Tensor,
-    staging_k: torch.Tensor,
-    staging_v: torch.Tensor,
-    head_ids: torch.Tensor,
-    frame_ids: torch.Tensor,
-    frame_seqlen: int,
-) -> int:
-    """CPU gather selected frame/head KV into pinned contiguous staging buffers."""
-    module = _load_module()
-    if module is None or not hasattr(module, "kv_sparse_pack_frames_to_staging"):
-        return 0
-    return int(
-        module.kv_sparse_pack_frames_to_staging(
-            cpu_k,
-            cpu_v,
-            staging_k,
-            staging_v,
-            head_ids,
-            frame_ids,
-            int(frame_seqlen),
-        )
-    )
-
-
-def pack_kv_frames_to_compact_pinned_staging(
-    *,
-    cpu_k: torch.Tensor,
-    cpu_v: torch.Tensor,
-    staging_k: torch.Tensor,
-    staging_v: torch.Tensor,
-    head_ids: torch.Tensor,
-    frame_ids: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    frame_seqlen: int,
-) -> int:
-    """CPU gather selected frame/head KV into compact pinned staging buffers."""
-    module = _load_module()
-    if module is None or not hasattr(module, "kv_sparse_pack_frames_to_compact_staging"):
-        return 0
-    return int(
-        module.kv_sparse_pack_frames_to_compact_staging(
-            cpu_k,
-            cpu_v,
-            staging_k,
-            staging_v,
-            head_ids,
-            frame_ids,
-            cu_seqlens,
-            int(frame_seqlen),
-        )
-    )
-
-
-def copy_kv_frames_to_gpu_staging(
-    *,
-    cpu_k: torch.Tensor,
-    cpu_v: torch.Tensor,
-    staging_k: torch.Tensor,
-    staging_v: torch.Tensor,
-    head_ids: torch.Tensor,
-    frame_ids: torch.Tensor,
-    frame_seqlen: int,
-) -> int:
-    """Copy selected frame/head KV directly from pinned CPU cache to GPU staging."""
-    module = _load_module()
-    if module is None or not hasattr(module, "kv_sparse_copy_frames_to_staging"):
-        return 0
-    return int(
-        module.kv_sparse_copy_frames_to_staging(
-            cpu_k,
-            cpu_v,
-            staging_k,
-            staging_v,
-            head_ids,
-            frame_ids,
-            int(frame_seqlen),
-        )
-    )
-
-
 def copy_kv_frames_to_gpu_compact(
     *,
     cpu_k: torch.Tensor,
@@ -680,39 +346,6 @@ def copy_kv_frames_to_gpu_compact(
             cu_seqlens,
             int(frame_seqlen),
             bool(cpu_head_major),
-        )
-    )
-
-
-def scatter_staging_to_gpu_slots(
-    *,
-    staging_k: torch.Tensor,
-    staging_v: torch.Tensor,
-    gpu_k: torch.Tensor,
-    gpu_v: torch.Tensor,
-    head_ids: torch.Tensor,
-    slot_ids: torch.Tensor,
-    src_rows: torch.Tensor,
-    src_cols: torch.Tensor,
-    frame_seqlen: int,
-    gpu_cache_frames: int,
-) -> int:
-    """Scatter staged miss KV into GPU cache slots with one CUDA kernel."""
-    module = _load_module()
-    if module is None or not hasattr(module, "kv_sparse_scatter_staging_to_slots"):
-        return 0
-    return int(
-        module.kv_sparse_scatter_staging_to_slots(
-            staging_k,
-            staging_v,
-            gpu_k,
-            gpu_v,
-            head_ids,
-            slot_ids,
-            src_rows,
-            src_cols,
-            int(frame_seqlen),
-            int(gpu_cache_frames),
         )
     )
 
@@ -752,41 +385,6 @@ def copy_compact_to_gpu_slots_d2d(
     )
 
 
-def copy_live_kv_runs_to_gpu_slots(
-    *,
-    live_k: torch.Tensor,
-    live_v: torch.Tensor,
-    gpu_k: torch.Tensor,
-    gpu_v: torch.Tensor,
-    head_ids: torch.Tensor,
-    token_starts: torch.Tensor,
-    slot_ids: torch.Tensor,
-    token_lens: torch.Tensor,
-    frame_seqlen: int,
-    gpu_live_temp_frames: int,
-    dst_token_base: int,
-) -> int:
-    """Batched async DtoD copy of live KV token runs into paged temp slots."""
-    module = _load_module()
-    if module is None or not hasattr(module, "kv_sparse_copy_live_runs_to_slots"):
-        return 0
-    return int(
-        module.kv_sparse_copy_live_runs_to_slots(
-            live_k,
-            live_v,
-            gpu_k,
-            gpu_v,
-            head_ids,
-            token_starts,
-            slot_ids,
-            token_lens,
-            int(frame_seqlen),
-            int(gpu_live_temp_frames),
-            int(dst_token_base),
-        )
-    )
-
-
 def copy_kv_span_to_cpu_cache(
     *,
     gpu_k_span: torch.Tensor,
@@ -807,47 +405,6 @@ def copy_kv_span_to_cpu_cache(
             cpu_v,
             int(start_token),
         )
-    )
-
-
-def plan_kv_frame_slots(
-    *,
-    head_indices: torch.Tensor,
-    frame_indices: torch.Tensor,
-    total_tokens: int,
-    frame_seqlen: int,
-    num_heads: int,
-    gpu_cache_frames: int,
-    live_start_index: int,
-    live_len: int,
-    has_live: bool,
-    frame_maps: list[dict[int, int]],
-    slot_frame_ids: list[list[int]],
-    slot_frame_lens: list[list[int]],
-    slot_last_used: list[list[int]],
-    gpu_clock: int,
-) -> dict[str, Any] | None:
-    """Run CPU-side sparse-KV slot planning inside the extension."""
-    if not _plan_enabled_by_env():
-        return None
-    module = _load_module()
-    if module is None or not hasattr(module, "kv_sparse_plan_slots"):
-        return None
-    return module.kv_sparse_plan_slots(
-        head_indices,
-        frame_indices,
-        int(total_tokens),
-        int(frame_seqlen),
-        int(num_heads),
-        int(gpu_cache_frames),
-        int(live_start_index),
-        int(live_len),
-        bool(has_live),
-        frame_maps,
-        slot_frame_ids,
-        slot_frame_lens,
-        slot_last_used,
-        int(gpu_clock),
     )
 
 

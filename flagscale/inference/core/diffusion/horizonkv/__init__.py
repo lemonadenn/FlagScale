@@ -4,6 +4,6 @@
 
 The package keeps the public FlagScale adapters at this level.  The
 ``algorithm`` package contains sparse KV selection, cache/offload and overlap
-execution, while ``wan.modules`` contains the causal Wan model components.
+execution, while ``wan`` contains the causal Wan model components.
 CUDA extensions are loaded lazily only after the worker preflight succeeds.
 """
